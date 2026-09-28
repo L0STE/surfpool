@@ -1695,7 +1695,12 @@ impl SurfnetSvm {
 
     /// Returns the slot visible at `commitment`.
     pub fn slot_for_commitment(&self, commitment: &CommitmentConfig) -> Slot {
-        super::slot_for_commitment(self.get_latest_absolute_slot(), commitment.commitment)
+        let slot = self.get_latest_absolute_slot();
+        match commitment.commitment {
+            CommitmentLevel::Processed => slot,
+            CommitmentLevel::Confirmed => slot.saturating_sub(1),
+            CommitmentLevel::Finalized => slot.saturating_sub(FINALIZATION_SLOT_THRESHOLD),
+        }
     }
 
     /// Recent blockhashes from the chain tip back, newest first.

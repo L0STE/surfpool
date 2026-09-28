@@ -28,24 +28,21 @@ use solana_transaction_status::{
 
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
-    surfnet::{locker::SurfnetSvmLocker, slot_for_commitment},
+    surfnet::locker::SurfnetSvmLocker,
 };
 
 /// Returns the slot a read at `commitment` answers for, judged before the read.
 ///
 /// As with Agave's `get_bank_with_config`, a `min_context_slot` above it is refused before any
 /// work, and this one slot is reported as the response context. The surfnet keeps one account
-/// state and never rolls it back, so a value read afterwards reflects every transaction up to
-/// this slot, and may already reflect later ones.
+/// state, so a value read afterwards reflects every transaction up to this slot, and may already
+/// reflect later ones.
 pub fn context_slot(
     svm_locker: &SurfnetSvmLocker,
     commitment: Option<CommitmentConfig>,
     min_context_slot: Option<Slot>,
 ) -> Result<Slot> {
-    let slot = slot_for_commitment(
-        svm_locker.get_latest_absolute_slot(),
-        commitment.unwrap_or_default().commitment,
-    );
+    let slot = svm_locker.get_slot_for_commitment(&commitment.unwrap_or_default());
     match min_context_slot {
         Some(min_context_slot) if slot < min_context_slot => {
             Err(RpcCustomError::MinContextSlotNotReached { context_slot: slot }.into())
