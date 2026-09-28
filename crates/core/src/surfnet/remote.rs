@@ -200,6 +200,15 @@ impl SomeRemoteCtx for Option<SurfnetRemoteClient> {
     }
 }
 
+/// `minContextSlot` names a slot of this surfnet, which the datasource never produced. The
+/// surfnet judges it against its own slot before answering, so it is not forwarded.
+fn for_datasource(config: &RpcAccountInfoConfig) -> RpcAccountInfoConfig {
+    RpcAccountInfoConfig {
+        min_context_slot: None,
+        ..config.clone()
+    }
+}
+
 impl SurfnetRemoteClient {
     pub fn new<U: ToString>(remote_rpc_url: U) -> Self {
         Self::try_new(remote_rpc_url).expect("unable to initialize datasource client")
@@ -486,7 +495,11 @@ impl SurfnetRemoteClient {
             .client
             .send(
                 RpcRequest::GetTokenAccountsByOwner,
-                json!([owner.to_string(), token_account_filter, config]),
+                json!([
+                    owner.to_string(),
+                    token_account_filter,
+                    for_datasource(config)
+                ]),
             )
             .await;
         match res {
@@ -541,7 +554,11 @@ impl SurfnetRemoteClient {
             .client
             .send(
                 RpcRequest::GetTokenAccountsByDelegate,
-                json!([delegate.to_string(), token_account_filter, config]),
+                json!([
+                    delegate.to_string(),
+                    token_account_filter,
+                    for_datasource(config)
+                ]),
             )
             .await;
 
@@ -562,7 +579,7 @@ impl SurfnetRemoteClient {
                     RpcProgramAccountsConfig {
                         filters,
                         with_context: Some(false),
-                        account_config,
+                        account_config: for_datasource(&account_config),
                         ..Default::default()
                     },
                 )
@@ -1196,6 +1213,46 @@ mod tests {
 
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].pubkey, token_account_pubkey.to_string());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forwarded_reads_leave_min_context_slot_to_the_surfnet() {
+        let requests = Arc::new(Mutex::new(vec![]));
+        let client = SurfnetRemoteClient {
+            client: RpcClient::new_sender(
+                ReturnsNull {
+                    requests: Arc::clone(&requests),
+                },
+                RpcClientConfig::default(),
+            )
+            .into(),
+        };
+        let config = RpcAccountInfoConfig {
+            min_context_slot: Some(42),
+            ..Default::default()
+        };
+        let token_program = TokenAccountsFilter::ProgramId(spl_token_interface::ID);
+
+        // Only what was sent matters; a null answer is not a valid response.
+        let _ = client
+            .get_token_accounts_by_owner(Pubkey::new_unique(), &token_program, &config)
+            .await;
+        let _ = client
+            .get_token_accounts_by_delegate(Pubkey::new_unique(), &token_program, &config)
+            .await;
+        let _ = client
+            .get_program_accounts(&Pubkey::new_unique(), config, None)
+            .await;
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            [
+                &requests[0].1[2]["minContextSlot"],
+                &requests[1].1[2]["minContextSlot"],
+                &requests[2].1[1]["minContextSlot"],
+            ],
+            [&serde_json::Value::Null; 3]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
