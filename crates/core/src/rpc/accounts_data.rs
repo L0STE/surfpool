@@ -1023,6 +1023,116 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_interest_bearing_amounts_accrue_to_current_clock() {
+        use spl_token_2022_interface::{
+            extension::{
+                BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
+                interest_bearing_mint::InterestBearingConfig,
+            },
+            state::{Account as Token2022Account, Mint as Token2022Mint},
+        };
+
+        let setup = TestSetup::new(SurfpoolAccountsDataRpc);
+        let (mint, holder) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let t0 = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.inner.get_sysvar::<Clock>().unix_timestamp);
+        let t1 = t0 + 365 * 24 * 60 * 60;
+
+        let len = ExtensionType::try_calculate_account_len::<Token2022Mint>(&[
+            ExtensionType::InterestBearingConfig,
+        ])
+        .unwrap();
+        let mut mint_data = vec![0; len];
+        let mut state =
+            StateWithExtensionsMut::<Token2022Mint>::unpack_uninitialized(&mut mint_data).unwrap();
+        let config = state.init_extension::<InterestBearingConfig>(true).unwrap();
+        config.initialization_timestamp = t0.into();
+        config.last_update_timestamp = t0.into();
+        config.pre_update_average_rate = 500.into();
+        config.current_rate = 500.into();
+        let config = *config;
+        state.base = Token2022Mint {
+            supply: 1_000_000,
+            decimals: 6,
+            is_initialized: true,
+            ..Default::default()
+        };
+        state.pack_base();
+        state.init_account_type().unwrap();
+
+        let mut holder_data = vec![0; Token2022Account::LEN];
+        Token2022Account {
+            mint,
+            owner: Pubkey::new_unique(),
+            amount: 1_000_000,
+            state: spl_token_2022_interface::state::AccountState::Initialized,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut holder_data);
+
+        setup.context.svm_locker.with_svm_writer(|svm| {
+            for (pubkey, data) in [(mint, mint_data), (holder, holder_data)] {
+                let account = Account {
+                    lamports: svm.inner.minimum_balance_for_rent_exemption(data.len()),
+                    data,
+                    owner: spl_token_2022_interface::id(),
+                    executable: false,
+                    rent_epoch: 0,
+                };
+                svm.set_account(&pubkey, account).unwrap();
+            }
+            let mut clock = svm.inner.get_sysvar::<Clock>();
+            clock.unix_timestamp = t1;
+            svm.inner.set_sysvar(&clock);
+        });
+
+        let amount_at = |ts| {
+            token_amount_to_ui_amount_v3(
+                1_000_000,
+                &SplTokenAdditionalDataV2 {
+                    decimals: 6,
+                    interest_bearing_config: Some((config, ts)),
+                    ..Default::default()
+                },
+            )
+        };
+        let expected = amount_at(t1);
+        assert_ne!(expected, amount_at(t0));
+
+        let balance = setup
+            .rpc
+            .get_token_account_balance(Some(setup.context.clone()), holder.to_string(), None)
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(balance, Some(expected.clone()));
+
+        let account = setup
+            .rpc
+            .get_account_info(
+                Some(setup.context),
+                holder.to_string(),
+                Some(RpcAccountInfoConfig {
+                    encoding: Some(solana_account_decoder::UiAccountEncoding::JsonParsed),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let solana_account_decoder::UiAccountData::Json(parsed) = account.data else {
+            panic!("holder was not jsonParsed");
+        };
+        assert_eq!(
+            parsed.parsed["info"]["tokenAmount"],
+            serde_json::to_value(&expected).unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_get_token_supply_does_not_overflow_for_twenty_decimals() {
         let setup = TestSetup::new(SurfpoolAccountsDataRpc);
         let (mint, _, config) = set_scaled_mint(&setup, 20);
