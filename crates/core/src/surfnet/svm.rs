@@ -1924,6 +1924,7 @@ impl SurfnetSvm {
     /// # Returns
     /// `Ok(())` on success, or an error if the operation fails.
     pub fn set_account(&mut self, pubkey: &Pubkey, account: Account) -> SurfpoolResult<()> {
+        let before = self.get_account(pubkey)?;
         self.inner
             .set_account(*pubkey, account.clone())
             .map_err(|e| SurfpoolError::set_account(*pubkey, e))?;
@@ -1932,7 +1933,7 @@ impl SurfnetSvm {
             .insert(*pubkey, self.get_latest_absolute_slot());
 
         // Update the account registries and indexes
-        self.update_account_registries(pubkey, &account)?;
+        self.update_account_registries(pubkey, before.as_ref(), &account)?;
 
         // Notify account subscribers
         self.notify_account_subscribers(pubkey, &account);
@@ -1944,9 +1945,12 @@ impl SurfnetSvm {
         Ok(())
     }
 
+    /// `before` is the account as it was before this update: the inner SVM already holds the new
+    /// state, so it can no longer be read back from there.
     pub fn update_account_registries(
         &mut self,
         pubkey: &Pubkey,
+        before: Option<&Account>,
         account: &Account,
     ) -> SurfpoolResult<()> {
         let is_deleted_account = account == &Account::default();
@@ -1961,27 +1965,23 @@ impl SurfnetSvm {
                 .set_account_in_db(*pubkey, account.clone().into())?;
         }
 
+        // Drop the owner/mint/delegate entries of the prior version of the
+        // account; otherwise a closed account, or the old owner's bucket after
+        // a change of owner, would keep pointing at `pubkey`.
+        if let Some(before) = before {
+            self.remove_from_indexes(pubkey, before)?;
+        }
+
         if is_deleted_account {
             // Record the account as offline so the surfnet does not re-fetch
-            // it from the upstream RPC, then drop any stale index entries
-            // that pointed at its prior on-chain state.
+            // it from the upstream RPC.
             self.offline_accounts.store(
                 pubkey.to_string(),
                 OfflineAccountConfig {
                     include_owned_accounts: false,
                 },
             )?;
-            if let Some(old_account) = self.get_account(pubkey)? {
-                self.remove_from_indexes(pubkey, &old_account)?;
-            }
             return Ok(());
-        }
-
-        // Drop any stale owner/mint/delegate entries for the prior version of
-        // the account before indexing the new one; otherwise a change of
-        // owner would leave the old owner's bucket pointing at `pubkey`.
-        if let Some(old_account) = self.get_account(pubkey)? {
-            self.remove_from_indexes(pubkey, &old_account)?;
         }
 
         let pubkey_str = pubkey.to_string();
@@ -6172,7 +6172,7 @@ mod tests {
         assert_eq!(svm.get_account_owned_by(&owner).unwrap().len(), 1);
 
         let empty_account = Account::default();
-        svm.update_account_registries(&account_pubkey, &empty_account)
+        svm.update_account_registries(&account_pubkey, Some(&account), &empty_account)
             .unwrap();
 
         assert!(
@@ -6220,7 +6220,8 @@ mod tests {
             rent_epoch: 0,
         };
 
-        svm.set_account(&token_account_pubkey, account).unwrap();
+        svm.set_account(&token_account_pubkey, account.clone())
+            .unwrap();
 
         assert_eq!(
             svm.get_token_accounts_by_owner(&token_owner).unwrap().len(),
@@ -6234,7 +6235,7 @@ mod tests {
         );
 
         let empty_account = Account::default();
-        svm.update_account_registries(&token_account_pubkey, &empty_account)
+        svm.update_account_registries(&token_account_pubkey, Some(&account), &empty_account)
             .unwrap();
 
         assert!(
@@ -7771,6 +7772,37 @@ mod tests {
             read(ALLOWED_OFFSET),
             5_678,
             "the second override must apply"
+        );
+    }
+
+    /// An account that changes owner is listed only under its new owner.
+    #[test]
+    fn an_account_is_listed_only_under_its_current_owner() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (account, old_owner, new_owner) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let owned_by = |owner| Account {
+            lamports: 1_000_000,
+            owner,
+            ..Default::default()
+        };
+
+        svm.set_account(&account, owned_by(old_owner)).unwrap();
+        svm.set_account(&account, owned_by(new_owner)).unwrap();
+
+        let listed = |svm: &SurfnetSvm, owner| {
+            svm.get_account_owned_by(&owner)
+                .unwrap()
+                .into_iter()
+                .map(|(pubkey, _)| pubkey)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            (listed(&svm, old_owner), listed(&svm, new_owner)),
+            (vec![], vec![account])
         );
     }
 }
