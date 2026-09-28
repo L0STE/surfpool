@@ -34,6 +34,7 @@ use solana_client::{
 use solana_clock::{Clock, Slot, UnixTimestamp};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_epoch_info::EpochInfo;
+use solana_epoch_schedule::EpochSchedule;
 use solana_hash::Hash;
 use solana_loader_v3_interface::{get_program_data_address, state::UpgradeableLoaderState};
 use solana_message::{
@@ -3944,17 +3945,24 @@ impl SurfnetSvmLocker {
         simnet_command_tx: Sender<SimnetCommand>,
         config: TimeTravelConfig,
     ) -> SurfpoolResult<EpochInfo> {
-        let (epoch_info, slot_time, updated_at) = self.with_svm_reader(|svm_reader| {
-            (
-                svm_reader.latest_epoch_info.clone(),
-                svm_reader.slot_time,
-                svm_reader.updated_at,
-            )
-        });
+        let (epoch_info, epoch_schedule, slot_time, updated_at) =
+            self.with_svm_reader(|svm_reader| {
+                (
+                    svm_reader.latest_epoch_info.clone(),
+                    svm_reader.inner.get_sysvar::<EpochSchedule>(),
+                    svm_reader.slot_time,
+                    svm_reader.updated_at,
+                )
+            });
 
-        let clock_update: Clock =
-            calculate_time_travel_clock(&config, updated_at, slot_time, &epoch_info)
-                .map_err(|e| SurfpoolError::internal(e.to_string()))?;
+        let clock_update: Clock = calculate_time_travel_clock(
+            &config,
+            updated_at,
+            slot_time,
+            &epoch_info,
+            &epoch_schedule,
+        )
+        .map_err(|e| SurfpoolError::internal(e.to_string()))?;
 
         let formated_time = chrono::DateTime::from_timestamp(clock_update.unix_timestamp, 0)
             .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap())

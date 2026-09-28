@@ -819,10 +819,12 @@ impl SurfnetSvm {
     }
 
     pub(crate) fn default_epoch_info(epoch_schedule: &EpochSchedule) -> EpochInfo {
+        let (epoch, slot_index) =
+            epoch_schedule.get_epoch_and_slot_index(FINALIZATION_SLOT_THRESHOLD);
         EpochInfo {
-            epoch: 0,
-            slot_index: 0,
-            slots_in_epoch: epoch_schedule.slots_per_epoch,
+            epoch,
+            slot_index,
+            slots_in_epoch: epoch_schedule.get_slots_in_epoch(epoch),
             absolute_slot: FINALIZATION_SLOT_THRESHOLD,
             block_height: FINALIZATION_SLOT_THRESHOLD,
             transaction_count: None,
@@ -2726,6 +2728,17 @@ impl SurfnetSvm {
         )
     }
 
+    /// Moves the chain to `absolute_slot`, at the epoch, slot index and epoch length the epoch
+    /// schedule gives it.
+    pub(crate) fn set_latest_absolute_slot(&mut self, absolute_slot: Slot) {
+        let epoch_schedule = self.inner.get_sysvar::<EpochSchedule>();
+        let (epoch, slot_index) = epoch_schedule.get_epoch_and_slot_index(absolute_slot);
+        self.latest_epoch_info.absolute_slot = absolute_slot;
+        self.latest_epoch_info.epoch = epoch;
+        self.latest_epoch_info.slot_index = slot_index;
+        self.latest_epoch_info.slots_in_epoch = epoch_schedule.get_slots_in_epoch(epoch);
+    }
+
     pub fn confirm_current_block(&mut self) -> SurfpoolResult<()> {
         let slot = self.get_latest_absolute_slot();
         // `slotsUpdatesSubscribe` clients expect millisecond-precision Unix
@@ -2781,13 +2794,8 @@ impl SurfnetSvm {
             num_non_vote_transactions: Some(num_transactions),
         });
 
-        self.latest_epoch_info.slot_index += 1;
         self.latest_epoch_info.block_height = self.chain_tip.index;
-        self.latest_epoch_info.absolute_slot += 1;
-        if self.latest_epoch_info.slot_index > self.latest_epoch_info.slots_in_epoch {
-            self.latest_epoch_info.slot_index = 0;
-            self.latest_epoch_info.epoch += 1;
-        }
+        self.set_latest_absolute_slot(self.latest_epoch_info.absolute_slot + 1);
         let total_transactions = self.latest_epoch_info.transaction_count.unwrap_or(0);
         self.latest_epoch_info.transaction_count = Some(total_transactions + num_transactions);
 
@@ -7771,6 +7779,74 @@ mod tests {
             read(ALLOWED_OFFSET),
             5_678,
             "the second override must apply"
+        );
+    }
+
+    /// The epoch, slot index and epoch length are the ones the epoch schedule gives the absolute
+    /// slot, at start and as blocks cross an epoch boundary, with and without warmup.
+    #[test]
+    fn epoch_info_follows_the_absolute_slot() {
+        for schedule in [
+            EpochSchedule::without_warmup(),
+            EpochSchedule::custom(432_000, 432_000, true),
+        ] {
+            let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+            svm.inner.set_sysvar(&schedule);
+            let mut seen = vec![SurfnetSvm::default_epoch_info(&schedule)];
+            svm.latest_epoch_info.absolute_slot = schedule.get_first_slot_in_epoch(1) - 2;
+            for _ in 0..3 {
+                svm.confirm_current_block().unwrap();
+                seen.push(svm.latest_epoch_info.clone());
+            }
+
+            let actual = seen
+                .iter()
+                .map(|info| {
+                    (
+                        info.absolute_slot,
+                        info.epoch,
+                        info.slot_index,
+                        info.slots_in_epoch,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let expected = seen
+                .iter()
+                .map(|info| {
+                    let (epoch, slot_index) = schedule.get_epoch_and_slot_index(info.absolute_slot);
+                    (
+                        info.absolute_slot,
+                        epoch,
+                        slot_index,
+                        schedule.get_slots_in_epoch(epoch),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "warmup: {}", schedule.warmup);
+        }
+    }
+
+    /// Garbage collection rebuilds LiteSVM, and must keep the epoch schedule the surfnet was
+    /// started with: the epoch info is derived from it.
+    #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+    fn garbage_collection_keeps_the_epoch_schedule(test_type: TestType) {
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        let gc_slot = *GARBAGE_COLLECTION_INTERVAL_SLOTS;
+        svm.latest_epoch_info.absolute_slot = gc_slot;
+        svm.latest_epoch_info.slot_index = gc_slot;
+
+        svm.confirm_current_block().unwrap();
+
+        let info = &svm.latest_epoch_info;
+        assert_eq!(
+            (
+                svm.inner.get_sysvar::<EpochSchedule>(),
+                info.absolute_slot,
+                info.epoch,
+                info.slot_index
+            ),
+            (EpochSchedule::without_warmup(), gc_slot + 1, 0, gc_slot + 1)
         );
     }
 }
