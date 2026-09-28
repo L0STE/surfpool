@@ -649,10 +649,22 @@ where
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use solana_client::rpc_request::RpcResponseErrorData;
+    use solana_client::{
+        rpc_config::{RpcContextConfig, RpcProgramAccountsConfig, RpcTokenAccountsFilter},
+        rpc_custom_error::RpcCustomError,
+        rpc_request::RpcResponseErrorData,
+    };
 
     use super::*;
-    use crate::surfnet::{locker::SurfnetSvmLocker, svm::SurfnetSvm};
+    use crate::{
+        rpc::{
+            accounts_data::{AccountsData, SurfpoolAccountsDataRpc},
+            accounts_scan::{AccountsScan, SurfpoolAccountsScanRpc},
+            minimal::{Minimal, SurfpoolMinimalRpc},
+        },
+        surfnet::{locker::SurfnetSvmLocker, svm::SurfnetSvm},
+        tests::helpers::TestSetup,
+    };
 
     struct ReturnsNull {
         requests: Arc<Mutex<Vec<(RpcRequest, serde_json::Value)>>>,
@@ -1184,5 +1196,86 @@ mod tests {
 
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].pubkey, token_account_pubkey.to_string());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_refused_for_min_context_slot_never_reaches_the_datasource() {
+        let requests = Arc::new(Mutex::new(vec![]));
+        let mut setup = TestSetup::new(SurfpoolAccountsDataRpc);
+        setup.context.remote_rpc_client = Some(SurfnetRemoteClient {
+            client: RpcClient::new_sender(
+                ReturnsNull {
+                    requests: Arc::clone(&requests),
+                },
+                RpcClientConfig::default(),
+            )
+            .into(),
+        });
+        let processed = setup.context.svm_locker.get_latest_absolute_slot();
+        let context = RpcContextConfig {
+            commitment: Some(CommitmentConfig::processed()),
+            min_context_slot: Some(processed + 1),
+        };
+        let config = RpcAccountInfoConfig {
+            commitment: context.commitment,
+            min_context_slot: context.min_context_slot,
+            ..Default::default()
+        };
+        let meta = || Some(setup.context.clone());
+        let pubkey = || Pubkey::new_unique().to_string();
+        let token_program =
+            || RpcTokenAccountsFilter::ProgramId(spl_token_interface::ID.to_string());
+
+        let refusals = [
+            (SurfpoolAccountsDataRpc.get_account_info(meta(), pubkey(), Some(config.clone())))
+                .await
+                .err(),
+            (SurfpoolAccountsDataRpc.get_multiple_accounts(
+                meta(),
+                vec![pubkey()],
+                Some(config.clone()),
+            ))
+            .await
+            .err(),
+            (SurfpoolMinimalRpc.get_balance(meta(), pubkey(), Some(context)))
+                .await
+                .err(),
+            (SurfpoolAccountsScanRpc.get_program_accounts(
+                meta(),
+                pubkey(),
+                Some(RpcProgramAccountsConfig {
+                    account_config: config.clone(),
+                    ..Default::default()
+                }),
+            ))
+            .await
+            .err(),
+            (SurfpoolAccountsScanRpc.get_token_accounts_by_owner(
+                meta(),
+                pubkey(),
+                token_program(),
+                Some(config.clone()),
+            ))
+            .await
+            .err(),
+            (SurfpoolAccountsScanRpc.get_token_accounts_by_delegate(
+                meta(),
+                pubkey(),
+                token_program(),
+                Some(config),
+            ))
+            .await
+            .err(),
+        ];
+
+        let not_reached: jsonrpc_core::Error = RpcCustomError::MinContextSlotNotReached {
+            context_slot: processed,
+        }
+        .into();
+        assert_eq!(refusals, [(); 6].map(|_| Some(not_reached.clone())));
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "the datasource was asked"
+        );
     }
 }

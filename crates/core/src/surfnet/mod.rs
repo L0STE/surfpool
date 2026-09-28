@@ -36,6 +36,17 @@ pub mod surfnet_lite_svm;
 pub mod svm;
 
 pub const FINALIZATION_SLOT_THRESHOLD: u64 = 31;
+
+/// Returns the slot visible at `commitment` while `latest_absolute_slot` is being built.
+pub const fn slot_for_commitment(latest_absolute_slot: Slot, commitment: CommitmentLevel) -> Slot {
+    match commitment {
+        CommitmentLevel::Processed => latest_absolute_slot,
+        CommitmentLevel::Confirmed => latest_absolute_slot.saturating_sub(1),
+        CommitmentLevel::Finalized => {
+            latest_absolute_slot.saturating_sub(FINALIZATION_SLOT_THRESHOLD)
+        }
+    }
+}
 pub const SLOTS_PER_EPOCH: u64 = 432000;
 
 pub type AccountFactory = Box<dyn Fn(SurfnetSvmLocker) -> GetAccountResult + Send + Sync>;

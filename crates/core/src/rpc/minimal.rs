@@ -5,7 +5,6 @@ use solana_client::{
         RpcContextConfig, RpcGetVoteAccountsConfig, RpcLeaderScheduleConfig,
         RpcLeaderScheduleConfigWrapper,
     },
-    rpc_custom_error::RpcCustomError,
     rpc_response::{
         RpcIdentity, RpcLeaderSchedule, RpcResponseContext, RpcSnapshotSlotInfo,
         RpcVoteAccountStatus,
@@ -19,7 +18,10 @@ use solana_rpc_client_api::response::Response as RpcResponse;
 use super::{RunloopContext, SurfnetRpcContext};
 use crate::{
     SURFPOOL_IDENTITY_PUBKEY,
-    rpc::{State, utils::verify_pubkey},
+    rpc::{
+        State,
+        utils::{context_slot, verify_pubkey},
+    },
     surfnet::{FINALIZATION_SLOT_THRESHOLD, GetAccountResult, locker::SvmAccessContext},
 };
 
@@ -595,7 +597,6 @@ impl Minimal for SurfpoolMinimalRpc {
 
         let config = config.unwrap_or_default();
         let commitment_config = config.commitment.unwrap_or_default();
-        let min_ctx_slot = config.min_context_slot;
 
         let SurfnetRpcContext {
             svm_locker,
@@ -609,20 +610,15 @@ impl Minimal for SurfpoolMinimalRpc {
             #[cfg(feature = "prometheus")]
             let rpc_start = std::time::Instant::now();
 
+            let slot = context_slot(
+                svm_locker.get_latest_absolute_slot(),
+                config.commitment,
+                config.min_context_slot,
+            )?;
             let SvmAccessContext {
-                slot,
                 inner: account_update,
                 ..
             } = svm_locker.get_account(&remote_ctx, &pubkey, None).await?;
-
-            if let Some(min_slot) = min_ctx_slot
-                && slot < min_slot
-            {
-                return Err(RpcCustomError::MinContextSlotNotReached {
-                    context_slot: min_slot,
-                }
-                .into());
-            }
 
             let balance = match &account_update {
                 GetAccountResult::FoundAccount(_, account, _)
@@ -685,22 +681,11 @@ impl Minimal for SurfpoolMinimalRpc {
         let latest_absolute_slot = meta
             .with_svm_reader(|svm_reader| svm_reader.get_latest_absolute_slot())
             .map_err(Into::<jsonrpc_core::Error>::into)?;
-        let slot = match config.commitment.unwrap_or_default().commitment {
-            CommitmentLevel::Processed => latest_absolute_slot,
-            CommitmentLevel::Confirmed => latest_absolute_slot - 1,
-            CommitmentLevel::Finalized => latest_absolute_slot - FINALIZATION_SLOT_THRESHOLD,
-        };
-
-        if let Some(min_context_slot) = config.min_context_slot {
-            if slot < min_context_slot {
-                return Err(RpcCustomError::MinContextSlotNotReached {
-                    context_slot: min_context_slot,
-                }
-                .into());
-            }
-        }
-
-        Ok(slot)
+        context_slot(
+            latest_absolute_slot,
+            config.commitment,
+            config.min_context_slot,
+        )
     }
 
     fn get_block_height(
@@ -826,7 +811,7 @@ impl Minimal for SurfpoolMinimalRpc {
 #[cfg(test)]
 mod tests {
     use jsonrpc_core::ErrorCode;
-    use solana_client::rpc_config::RpcContextConfig;
+    use solana_client::{rpc_config::RpcContextConfig, rpc_custom_error::RpcCustomError};
     use solana_commitment_config::CommitmentConfig;
     use solana_epoch_info::EpochInfo;
     use solana_genesis_config::GenesisConfig;
@@ -1024,7 +1009,8 @@ mod tests {
             "Invalid returned lamports for the account"
         );
 
-        let wrong_min_slot = setup.context.svm_locker.get_latest_absolute_slot() + 100;
+        let latest_slot = setup.context.svm_locker.get_latest_absolute_slot();
+        let wrong_min_slot = latest_slot + 100;
 
         let fail_if_latest_slot_lt_min_ctx_slot_result = setup
             .rpc
@@ -1039,8 +1025,9 @@ mod tests {
             .await;
 
         let expected_err: Result<()> = Result::Err(
+            // No commitment reads at finalized, and the error names that slot, as on Agave.
             RpcCustomError::MinContextSlotNotReached {
-                context_slot: wrong_min_slot,
+                context_slot: latest_slot - FINALIZATION_SLOT_THRESHOLD,
             }
             .into(),
         );

@@ -7,9 +7,11 @@ use jsonrpc_core::{Error, Result};
 use litesvm::types::TransactionMetadata;
 use solana_client::{
     rpc_config::{RpcTokenAccountsFilter, RpcTransactionConfig},
+    rpc_custom_error::RpcCustomError,
     rpc_filter::RpcFilterType,
     rpc_request::{MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT, TokenAccountsFilter},
 };
+use solana_clock::Slot;
 use solana_commitment_config::CommitmentConfig;
 use solana_hash::Hash;
 use solana_message::{
@@ -24,7 +26,33 @@ use solana_transaction_status::{
     UiTransactionEncoding, parse_ui_inner_instructions,
 };
 
-use crate::error::{SurfpoolError, SurfpoolResult};
+use crate::{
+    error::{SurfpoolError, SurfpoolResult},
+    surfnet::slot_for_commitment,
+};
+
+/// Returns the slot a read at `commitment` answers for, judged before the read.
+///
+/// As with Agave's `get_bank_with_config`, a `min_context_slot` above it is refused before any
+/// work, and this one slot is reported as the response context. The surfnet keeps one account
+/// state and never rolls it back, so a value read afterwards reflects every transaction up to
+/// this slot, and may already reflect later ones.
+pub fn context_slot(
+    latest_absolute_slot: Slot,
+    commitment: Option<CommitmentConfig>,
+    min_context_slot: Option<Slot>,
+) -> Result<Slot> {
+    let slot = slot_for_commitment(
+        latest_absolute_slot,
+        commitment.unwrap_or_default().commitment,
+    );
+    match min_context_slot {
+        Some(min_context_slot) if slot < min_context_slot => {
+            Err(RpcCustomError::MinContextSlotNotReached { context_slot: slot }.into())
+        }
+        _ => Ok(slot),
+    }
+}
 
 pub fn convert_transaction_metadata_from_canonical(
     transaction_metadata: &TransactionMetadata,
