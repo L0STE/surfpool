@@ -1745,7 +1745,7 @@ impl SurfnetSvmLocker {
                 .map(|b| b.block_time as UnixTimestamp);
             let encoded = VersionedTransactionWithStatusMeta::from(transaction_with_status_meta)
                 .encode(
-                    config.encoding.unwrap_or(UiTransactionEncoding::JsonParsed),
+                    config.encoding.unwrap_or(UiTransactionEncoding::Json),
                     config.max_supported_transaction_version,
                     true,
                 )?;
