@@ -691,7 +691,7 @@ impl Minimal for SurfpoolMinimalRpc {
         let config = config.unwrap_or_default();
         let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
         Ok(svm_locker.with_svm_reader(|svm_reader| {
-            let blocks_since = svm_reader.get_latest_absolute_slot() - slot;
+            let blocks_since = svm_reader.get_latest_absolute_slot().saturating_sub(slot);
             svm_reader
                 .latest_epoch_info
                 .block_height
