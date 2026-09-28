@@ -39,7 +39,8 @@ use super::{
     RunloopContext, State, SurfnetRpcContext,
     utils::{
         decode_and_deserialize, decode_rpc_versioned_transaction,
-        transform_tx_metadata_to_ui_accounts, verify_pubkey,
+        transform_tx_metadata_to_ui_accounts, verify_and_parse_signatures_for_address_params,
+        verify_pubkey,
     },
 };
 use crate::{
@@ -2409,10 +2410,17 @@ impl Full for SurfpoolFullRpc {
         address: String,
         config: Option<RpcSignaturesForAddressConfig>,
     ) -> BoxFuture<Result<Vec<RpcConfirmedTransactionStatusWithSignature>>> {
-        let pubkey = match verify_pubkey(&address) {
-            Ok(s) => s,
-            Err(e) => return e.into(),
-        };
+        let RpcSignaturesForAddressConfig {
+            before,
+            until,
+            limit,
+            ..
+        } = config.clone().unwrap_or_default();
+        let pubkey =
+            match verify_and_parse_signatures_for_address_params(address, before, until, limit) {
+                Ok((pubkey, ..)) => pubkey,
+                Err(e) => return Box::pin(async move { Err(e) }),
+            };
         let SurfnetRpcContext {
             svm_locker,
             remote_ctx,
@@ -3221,6 +3229,42 @@ mod tests {
             get_fee_for_message(&setup, &with_priority_fee),
             5_000 + 25_000
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_signatures_for_address_rejects_invalid_params() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let bad = || Some("not-a-signature".to_string());
+
+        for config in [
+            RpcSignaturesForAddressConfig {
+                limit: Some(0),
+                ..Default::default()
+            },
+            RpcSignaturesForAddressConfig {
+                limit: Some(1001),
+                ..Default::default()
+            },
+            RpcSignaturesForAddressConfig {
+                before: bad(),
+                ..Default::default()
+            },
+            RpcSignaturesForAddressConfig {
+                until: bad(),
+                ..Default::default()
+            },
+        ] {
+            let err = setup
+                .rpc
+                .get_signatures_for_address(
+                    Some(setup.context.clone()),
+                    Pubkey::new_unique().to_string(),
+                    Some(config.clone()),
+                )
+                .await
+                .expect_err(&format!("{config:?} should be rejected"));
+            assert_eq!(err.code, jsonrpc_core::ErrorCode::InvalidParams);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
