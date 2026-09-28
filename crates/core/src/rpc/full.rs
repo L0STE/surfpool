@@ -2006,7 +2006,9 @@ impl Full for SurfpoolFullRpc {
                     .set_recent_blockhash(latest_blockhash);
                 Some(RpcBlockhash {
                     blockhash: latest_blockhash.to_string(),
-                    last_valid_block_height: latest_epoch_info.block_height,
+                    // The latest blockhash was minted at the current block height.
+                    last_valid_block_height: latest_epoch_info.block_height
+                        + MAX_RECENT_BLOCKHASHES_STANDARD as u64,
                 })
             } else {
                 None
@@ -3837,10 +3839,17 @@ mod tests {
             .context
             .svm_locker
             .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
-        let block_height = setup
-            .context
-            .svm_locker
-            .with_svm_reader(|svm_reader| svm_reader.latest_epoch_info.block_height);
+        let latest = setup
+            .rpc
+            .get_latest_blockhash(
+                Some(setup.context.clone()),
+                Some(RpcContextConfig {
+                    commitment: Some(CommitmentConfig::processed()),
+                    min_context_slot: None,
+                }),
+            )
+            .unwrap()
+            .value;
         let bad_blockhash = Hash::new_unique();
 
         let _ = setup
@@ -3919,12 +3928,11 @@ mod tests {
             simulation_res.value.err, None,
             "Unexpected simulation error"
         );
+        // As on a validator, the replacement is valid for exactly as long as `getLatestBlockhash`
+        // says the same blockhash is.
         assert_eq!(
             simulation_res.value.replacement_blockhash,
-            Some(RpcBlockhash {
-                blockhash: recent_blockhash.to_string(),
-                last_valid_block_height: block_height
-            }),
+            Some(latest),
             "Replacement blockhash should be the latest blockhash"
         );
     }
