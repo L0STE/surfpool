@@ -1453,7 +1453,7 @@ impl SurfnetSvm {
                     post_token_balances: Some(vec![]),
                     rewards: Some(vec![]),
                     loaded_addresses: LoadedAddresses::default(),
-                    return_data: Some(tx_result.return_data.clone()),
+                    return_data: Some(tx_result.return_data.clone()).filter(|d| !d.data.is_empty()),
                     compute_units_consumed: Some(tx_result.compute_units_consumed),
                     cost_units: None,
                 },
@@ -3672,7 +3672,7 @@ impl SurfnetSvm {
             block_height: Some(block.block_height),
         }
         .encode_with_options(
-            config.encoding.unwrap_or(UiTransactionEncoding::JsonParsed),
+            config.encoding.unwrap_or(UiTransactionEncoding::Json),
             BlockEncodingOptions {
                 transaction_details,
                 show_rewards: config.rewards.unwrap_or(true),

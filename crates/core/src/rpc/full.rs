@@ -4900,6 +4900,81 @@ mod tests {
         )
     }
 
+    fn is_json_raw(tx: &EncodedTransactionWithStatusMeta) -> bool {
+        matches!(
+            &tx.transaction,
+            EncodedTransaction::Json(UiTransaction {
+                message: UiMessage::Raw(_),
+                ..
+            })
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_block_defaults_to_json_encoding() {
+        let mut setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
+        let (_, _, _, slot) = confirmed_transfers(&mut setup).await;
+
+        let block = setup
+            .rpc
+            .get_block(
+                Some(setup.context),
+                slot,
+                Some(RpcEncodingConfigWrapper::Current(Some(RpcBlockConfig {
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    max_supported_transaction_version: Some(0),
+                    ..RpcBlockConfig::default()
+                }))),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let txs = block.transactions.unwrap();
+        assert!(!txs.is_empty());
+        assert!(txs.iter().all(is_json_raw), "{txs:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_transaction_local_defaults_to_json_encoding() {
+        let mut setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
+        let (_, ok, _, _) = confirmed_transfers(&mut setup).await;
+
+        let result = setup
+            .context
+            .svm_locker
+            .get_transaction_local(&ok, &RpcTransactionConfig::default())
+            .unwrap();
+
+        let GetTransactionResult::FoundTransaction(_, tx, _) = result else {
+            panic!("transaction not found");
+        };
+        assert!(is_json_raw(&tx.transaction), "{tx:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stored_transactions_omit_empty_return_data() {
+        let mut setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
+        let (airdrop, ok, failed, _) = confirmed_transfers(&mut setup).await;
+
+        for signature in [airdrop, ok, failed] {
+            let tx = setup
+                .rpc
+                .get_transaction(
+                    Some(setup.context.clone()),
+                    signature.to_string(),
+                    Some(RpcEncodingConfigWrapper::Current(Some(
+                        get_default_transaction_config(),
+                    ))),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let meta = tx.transaction.meta.unwrap();
+            assert_eq!(meta.return_data, OptionSerializer::Skip, "{signature}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_block_transaction_details_and_rewards() {
         let mut setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
