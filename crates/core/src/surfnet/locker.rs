@@ -15,7 +15,7 @@ use solana_account_decoder::{
     UiAccount, UiAccountEncoding, UiDataSliceConfig,
     parse_account_data::AccountAdditionalDataV3,
     parse_bpf_loader::{BpfUpgradeableLoaderAccountType, UiProgram, parse_bpf_upgradeable_loader},
-    parse_token::{UiTokenAmount, real_number_string_trimmed},
+    parse_token::token_amount_to_ui_amount_v3,
 };
 use solana_address_lookup_table_interface::state::AddressLookupTable;
 use solana_client::{
@@ -3102,29 +3102,14 @@ impl SurfnetSvmLocker {
         self.with_contextualized_svm_reader(|svm_reader| {
             let token_accounts = svm_reader.get_token_accounts_by_mint(mint);
 
-            // get mint information to determine decimals
-            let mint_decimals = if let Some(mint_account) =
-                svm_reader.token_mints.get(&mint.to_string()).ok().flatten()
-            {
-                mint_account.decimals()
-            } else {
-                0
-            };
+            let mint_data = svm_reader.mint_additional_data(mint).unwrap_or_default();
 
             // convert to RpcTokenAccountBalance and sort by balance
             let mut balances: Vec<RpcTokenAccountBalance> = token_accounts
                 .into_iter()
                 .map(|(pubkey, token_account)| RpcTokenAccountBalance {
                     address: pubkey.to_string(),
-                    amount: UiTokenAmount {
-                        amount: token_account.amount().to_string(),
-                        decimals: mint_decimals,
-                        ui_amount: format_ui_amount(token_account.amount(), mint_decimals),
-                        ui_amount_string: real_number_string_trimmed(
-                            token_account.amount(),
-                            mint_decimals,
-                        ),
-                    },
+                    amount: token_amount_to_ui_amount_v3(token_account.amount(), &mint_data),
                 })
                 .collect();
 
@@ -4634,15 +4619,6 @@ fn update_programdata_account(
     }
 }
 
-/// Scales a raw token amount by its mint's decimals for `UiTokenAmount::ui_amount`.
-///
-/// `None` when `decimals` is too large for `10^decimals` to fit a `usize`.
-pub fn format_ui_amount(amount: u64, decimals: u8) -> Option<f64> {
-    10_usize
-        .checked_pow(decimals as u32)
-        .map(|divisor| amount as f64 / divisor as f64)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -4655,7 +4631,7 @@ mod tests {
 
     use async_trait::async_trait;
     use solana_account::Account;
-    use solana_account_decoder::UiAccountEncoding;
+    use solana_account_decoder::{UiAccountEncoding, parse_token::UiTokenAmount};
     use solana_client::{
         nonblocking::rpc_client::RpcClient, rpc_client::RpcClientConfig, rpc_request::RpcRequest,
     };
@@ -7213,15 +7189,5 @@ mod tests {
             .expect("cached genesis hash should not require the remote RPC");
 
         assert_eq!(result.inner, expected_hash);
-    }
-
-    #[test]
-    fn test_format_ui_amount_scales_by_decimals() {
-        assert_eq!(format_ui_amount(0, 0), Some(0.0));
-        assert_eq!(format_ui_amount(1_500_000, 6), Some(1.5));
-        assert_eq!(format_ui_amount(42, 0), Some(42.0));
-        // `Mint::decimals` is an unvalidated u8; 10^decimals stops fitting a usize well
-        // before 255, and the field is Option<f64> so those mints have somewhere to land.
-        assert_eq!(format_ui_amount(1, 255), None);
     }
 }
