@@ -1228,7 +1228,7 @@ pub trait Full {
     /// # See Also
     /// - `getBlock`, `getBlockTime`, `minimumLedgerSlot`
     #[rpc(meta, name = "getFirstAvailableBlock")]
-    fn get_first_available_block(&self, meta: Self::Metadata) -> Result<Slot>;
+    fn get_first_available_block(&self, meta: Self::Metadata) -> BoxFuture<Result<Slot>>;
 
     /// Returns the latest blockhash and associated metadata needed to sign and send a transaction.
     ///
@@ -2481,18 +2481,31 @@ impl Full for SurfpoolFullRpc {
         })
     }
 
-    fn get_first_available_block(&self, meta: Self::Metadata) -> Result<Slot> {
-        meta.with_svm_reader(|svm_reader| {
-            Ok::<_, jsonrpc_core::Error>(
-                svm_reader
-                    .blocks
-                    .keys()?
-                    .into_iter()
-                    .min()
-                    .unwrap_or_default(),
-            )
-        })?
-        .map_err(Into::into)
+    fn get_first_available_block(&self, meta: Self::Metadata) -> BoxFuture<Result<Slot>> {
+        let SurfnetRpcContext {
+            svm_locker,
+            remote_ctx,
+        } = match meta.get_rpc_context(()) {
+            Ok(res) => res,
+            Err(e) => return e.into(),
+        };
+
+        Box::pin(async move {
+            // `getBlock` serves every slot from the first local slot on, and forwards the ones
+            // before it to the datasource, so on a fork the datasource's floor counts too, unless it
+            // has since pruned past the fork.
+            let first_local_slot = svm_locker.get_first_local_slot().unwrap_or_default();
+            if let Some((remote_client, _)) = remote_ctx {
+                remote_client
+                    .client
+                    .get_first_available_block()
+                    .await
+                    .map(|first| first.min(first_local_slot))
+                    .map_err(|e| SurfpoolError::client_error(e).into())
+            } else {
+                Ok(first_local_slot)
+            }
+        })
     }
 
     fn get_latest_blockhash(
@@ -2810,13 +2823,24 @@ fn get_simulate_transaction_result(
 mod tests {
     pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
-    use std::thread::JoinHandle;
+    use std::{
+        sync::{Arc, Mutex},
+        thread::JoinHandle,
+    };
 
+    use async_trait::async_trait;
     use base64::{Engine, prelude::BASE64_STANDARD};
     use bincode::Options;
     use crossbeam_channel::{Receiver, Sender};
     use solana_account_decoder::{UiAccount, UiAccountData, UiAccountEncoding};
-    use solana_client::rpc_config::RpcSimulateTransactionAccountsConfig;
+    use solana_client::{
+        client_error::Result as ClientResult,
+        nonblocking::rpc_client::RpcClient,
+        rpc_client::RpcClientConfig,
+        rpc_config::RpcSimulateTransactionAccountsConfig,
+        rpc_request::RpcRequest,
+        rpc_sender::{RpcSender, RpcTransportStats},
+    };
     use solana_commitment_config::CommitmentConfig;
     use solana_hash::Hash;
     use solana_instruction::Instruction;
@@ -4331,53 +4355,84 @@ mod tests {
         );
     }
 
+    /// The first available block is the lowest slot `getBlock` serves. A block stored at a later
+    /// slot must not move it: the slots before that block are empty, not purged.
     #[tokio::test(flavor = "multi_thread")]
-    #[allow(deprecated)]
     async fn test_get_first_available_block() {
         let setup = TestSetup::new(SurfpoolFullRpc);
+        insert_test_blocks(&setup, vec![100]);
 
-        {
-            let mut svm_writer = setup.context.svm_locker.0.write().await;
+        let first = setup
+            .rpc
+            .get_first_available_block(Some(setup.context.clone()))
+            .await
+            .unwrap();
+        let block_at = |slot| setup.rpc.get_block(Some(setup.context.clone()), slot, None);
 
-            let previous_chain_tip = svm_writer.chain_tip.clone();
+        assert_eq!(
+            (
+                block_at(first).await.map(|block| block.is_some()),
+                block_at(first - 1).await.map(|block| block.is_some()),
+            ),
+            (Ok(true), Err(SurfpoolError::slot_too_old(first - 1).into()))
+        );
+    }
 
-            let latest_entries = svm_writer
-                .inner
-                .get_sysvar::<solana_sysvar::recent_blockhashes::RecentBlockhashes>(
-            );
-            let latest_entry = latest_entries.first().unwrap();
+    /// Answers every request with its slot, recording which method was asked.
+    struct FirstAvailableBlockIs(Slot, Arc<Mutex<Vec<RpcRequest>>>);
 
-            svm_writer.chain_tip = BlockIdentifier::new(
-                svm_writer.chain_tip.index + 1,
-                latest_entry.blockhash.to_string().as_str(),
-            );
-
-            let hash = svm_writer.chain_tip.hash.clone();
-            let block_height = svm_writer.chain_tip.index;
-            let parent_slot = svm_writer.get_latest_absolute_slot();
-
-            svm_writer
-                .blocks
-                .store(
-                    parent_slot,
-                    BlockHeader {
-                        hash,
-                        previous_blockhash: previous_chain_tip.hash.clone(),
-                        block_time: chrono::Utc::now().timestamp_millis(),
-                        block_height,
-                        parent_slot,
-                        signatures: Vec::new(),
-                    },
-                )
-                .unwrap();
+    #[async_trait]
+    impl RpcSender for FirstAvailableBlockIs {
+        async fn send(
+            &self,
+            request: RpcRequest,
+            _params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            self.1.lock().unwrap().push(request);
+            Ok(serde_json::json!(self.0))
         }
 
-        let res = setup
-            .rpc
-            .get_first_available_block(Some(setup.context))
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "http://first-available-block.example".to_string()
+        }
+    }
+
+    /// `getBlock` forwards the slots before the fork to the datasource and serves the rest itself,
+    /// so the first available block is the lower of the datasource's and the first local slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_first_available_block_from_the_datasource() {
+        let first_local_slot = TestSetup::new(SurfpoolFullRpc)
+            .context
+            .svm_locker
+            .get_first_local_slot()
             .unwrap();
 
-        assert_eq!(res, 123);
+        // Before the fork, and pruned past it.
+        for (datasource_first, expected) in [(7, 7), (1_000, first_local_slot)] {
+            let requests = Arc::new(Mutex::new(vec![]));
+            let mut setup = TestSetup::new(SurfpoolFullRpc);
+            setup.context.remote_rpc_client = Some(SurfnetRemoteClient {
+                client: RpcClient::new_sender(
+                    FirstAvailableBlockIs(datasource_first, Arc::clone(&requests)),
+                    RpcClientConfig::default(),
+                )
+                .into(),
+            });
+
+            let first = setup
+                .rpc
+                .get_first_available_block(Some(setup.context))
+                .await;
+
+            assert_eq!(
+                (first, requests.lock().unwrap().clone()),
+                (Ok(expected), vec![RpcRequest::GetFirstAvailableBlock])
+            );
+        }
     }
 
     #[test]
