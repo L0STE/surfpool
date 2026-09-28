@@ -486,7 +486,7 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
         Box::pin(async move {
             let account_config = config.account_config;
             let slot = context_slot(
-                svm_locker.get_latest_absolute_slot(),
+                &svm_locker,
                 account_config.commitment,
                 account_config.min_context_slot,
             )?;
@@ -652,11 +652,7 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
         };
 
         Box::pin(async move {
-            let slot = context_slot(
-                svm_locker.get_latest_absolute_slot(),
-                config.commitment,
-                config.min_context_slot,
-            )?;
+            let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
             let SvmAccessContext {
                 inner: token_accounts,
                 ..
@@ -707,11 +703,7 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
                 }
             };
 
-            let slot = context_slot(
-                svm_locker.get_latest_absolute_slot(),
-                config.commitment,
-                config.min_context_slot,
-            )?;
+            let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
             let remote_ctx = remote_ctx.map(|(r, _)| r);
             let SvmAccessContext {
                 inner: keyed_accounts,

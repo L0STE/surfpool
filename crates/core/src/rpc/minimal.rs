@@ -609,11 +609,7 @@ impl Minimal for SurfpoolMinimalRpc {
             #[cfg(feature = "prometheus")]
             let rpc_start = std::time::Instant::now();
 
-            let slot = context_slot(
-                svm_locker.get_latest_absolute_slot(),
-                config.commitment,
-                config.min_context_slot,
-            )?;
+            let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
             let SvmAccessContext {
                 inner: account_update,
                 ..
@@ -642,16 +638,10 @@ impl Minimal for SurfpoolMinimalRpc {
         meta: Self::Metadata,
         config: Option<RpcContextConfig>,
     ) -> Result<EpochInfo> {
+        let svm_locker = meta.get_svm_locker()?;
         let config = config.unwrap_or_default();
-        let epoch_info = meta
-            .with_svm_reader(|svm_reader| svm_reader.latest_epoch_info.clone())
-            .map_err(Into::<jsonrpc_core::Error>::into)?;
-        context_slot(
-            epoch_info.absolute_slot,
-            config.commitment,
-            config.min_context_slot,
-        )?;
-        Ok(epoch_info)
+        context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
+        Ok(svm_locker.get_epoch_info())
     }
 
     fn get_genesis_hash(&self, meta: Self::Metadata) -> BoxFuture<Result<String>> {
@@ -685,11 +675,8 @@ impl Minimal for SurfpoolMinimalRpc {
 
     fn get_slot(&self, meta: Self::Metadata, config: Option<RpcContextConfig>) -> Result<Slot> {
         let config = config.unwrap_or_default();
-        let latest_absolute_slot = meta
-            .with_svm_reader(|svm_reader| svm_reader.get_latest_absolute_slot())
-            .map_err(Into::<jsonrpc_core::Error>::into)?;
         context_slot(
-            latest_absolute_slot,
+            &meta.get_svm_locker()?,
             config.commitment,
             config.min_context_slot,
         )
@@ -700,21 +687,16 @@ impl Minimal for SurfpoolMinimalRpc {
         meta: Self::Metadata,
         config: Option<RpcContextConfig>,
     ) -> Result<u64> {
+        let svm_locker = meta.get_svm_locker()?;
         let config = config.unwrap_or_default();
-        let (latest_absolute_slot, block_height) = meta
-            .with_svm_reader(|svm_reader| {
-                (
-                    svm_reader.get_latest_absolute_slot(),
-                    svm_reader.latest_epoch_info.block_height,
-                )
-            })
-            .map_err(Into::<jsonrpc_core::Error>::into)?;
-        let slot = context_slot(
-            latest_absolute_slot,
-            config.commitment,
-            config.min_context_slot,
-        )?;
-        Ok(block_height.saturating_sub(latest_absolute_slot - slot))
+        let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
+        Ok(svm_locker.with_svm_reader(|svm_reader| {
+            let blocks_since = svm_reader.get_latest_absolute_slot() - slot;
+            svm_reader
+                .latest_epoch_info
+                .block_height
+                .saturating_sub(blocks_since)
+        }))
     }
 
     fn get_highest_snapshot_slot(&self, _meta: Self::Metadata) -> Result<RpcSnapshotSlotInfo> {
@@ -730,21 +712,10 @@ impl Minimal for SurfpoolMinimalRpc {
         meta: Self::Metadata,
         config: Option<RpcContextConfig>,
     ) -> Result<u64> {
+        let svm_locker = meta.get_svm_locker()?;
         let config = config.unwrap_or_default();
-        let (latest_absolute_slot, transaction_count) = meta
-            .with_svm_reader(|svm_reader| {
-                (
-                    svm_reader.get_latest_absolute_slot(),
-                    svm_reader.transactions_processed,
-                )
-            })
-            .map_err(Into::<jsonrpc_core::Error>::into)?;
-        context_slot(
-            latest_absolute_slot,
-            config.commitment,
-            config.min_context_slot,
-        )?;
-        Ok(transaction_count)
+        context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
+        Ok(svm_locker.with_svm_reader(|svm_reader| svm_reader.transactions_processed))
     }
 
     fn get_version(&self, _: Self::Metadata) -> Result<SurfpoolRpcVersionInfo> {

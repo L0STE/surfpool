@@ -283,7 +283,7 @@ impl Jito for SurfpoolJitoRpc {
             let base_config = config.unwrap_or_default();
             // Bundles skip preflight, so they run against the processed slot.
             context_slot(
-                ctx.svm_locker.get_latest_absolute_slot(),
+                &ctx.svm_locker,
                 Some(CommitmentConfig::processed()),
                 base_config.min_context_slot,
             )?;

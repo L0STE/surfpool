@@ -1544,7 +1544,7 @@ impl Full for SurfpoolFullRpc {
             };
 
             context_slot(
-                svm_locker.get_latest_absolute_slot(),
+                &svm_locker,
                 config.as_ref().and_then(|config| config.commitment),
                 config.as_ref().and_then(|config| config.min_context_slot),
             )?;
@@ -1759,7 +1759,7 @@ impl Full for SurfpoolFullRpc {
             },
         };
         context_slot(
-            ctx.svm_locker.get_latest_absolute_slot(),
+            &ctx.svm_locker,
             Some(preflight_commitment),
             config.base.min_context_slot,
         )?;
@@ -1928,11 +1928,7 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
-            context_slot(
-                svm_locker.get_latest_absolute_slot(),
-                config.commitment,
-                config.min_context_slot,
-            )?;
+            context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
             let loaded_addresses = svm_locker
                 .get_loaded_addresses(&remote_ctx, &unsanitized_tx.message)
                 .await?;
@@ -2203,11 +2199,8 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
-            let committed_latest_slot = context_slot(
-                svm_locker.get_latest_absolute_slot(),
-                Some(commitment),
-                config.min_context_slot,
-            )?;
+            let committed_latest_slot =
+                context_slot(&svm_locker, Some(commitment), config.min_context_slot)?;
             let effective_end_slot = end_slot
                 .map(|end| end.min(committed_latest_slot))
                 .unwrap_or(committed_latest_slot);
@@ -2318,11 +2311,8 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
-            let committed_latest_slot = context_slot(
-                svm_locker.get_latest_absolute_slot(),
-                Some(commitment),
-                config.min_context_slot,
-            )?;
+            let committed_latest_slot =
+                context_slot(&svm_locker, Some(commitment), config.min_context_slot)?;
             let genesis_slot = svm_locker.with_svm_reader(|svm| svm.genesis_slot);
 
             // With sparse block storage, all slots from genesis_slot onwards are valid
@@ -2425,7 +2415,7 @@ impl Full for SurfpoolFullRpc {
 
         Box::pin(async move {
             context_slot(
-                svm_locker.get_latest_absolute_slot(),
+                &svm_locker,
                 config.as_ref().and_then(|config| config.commitment),
                 config.as_ref().and_then(|config| config.min_context_slot),
             )?;
@@ -2489,11 +2479,7 @@ impl Full for SurfpoolFullRpc {
         let config = config.unwrap_or_default();
         let commitment = config.commitment.unwrap_or_default();
 
-        let slot = context_slot(
-            svm_locker.get_latest_absolute_slot(),
-            Some(commitment),
-            config.min_context_slot,
-        )?;
+        let slot = context_slot(&svm_locker, Some(commitment), config.min_context_slot)?;
 
         let (blockhash, last_valid_block_height) = svm_locker.with_svm_reader(|svm_reader| {
             let blockhash = svm_reader
@@ -2531,11 +2517,7 @@ impl Full for SurfpoolFullRpc {
 
         let svm_locker = meta.get_svm_locker()?;
 
-        let slot = context_slot(
-            svm_locker.get_latest_absolute_slot(),
-            config.commitment,
-            config.min_context_slot,
-        )?;
+        let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
 
         let is_valid =
             svm_locker.with_svm_reader(|svm_reader| svm_reader.check_blockhash_is_recent(&hash));
@@ -2557,11 +2539,7 @@ impl Full for SurfpoolFullRpc {
 
         let config = config.unwrap_or_default();
         let svm_locker = meta.get_svm_locker()?;
-        let slot = context_slot(
-            svm_locker.get_latest_absolute_slot(),
-            config.commitment,
-            config.min_context_slot,
-        )?;
+        let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
 
         let fee = svm_locker
             .with_svm_reader(|svm_reader| svm_reader.estimate_fee_for_message(&message))?;
@@ -2583,7 +2561,7 @@ impl Full for SurfpoolFullRpc {
         });
 
         let slot = context_slot(
-            meta.get_svm_locker()?.get_latest_absolute_slot(),
+            &meta.get_svm_locker()?,
             Some(commitment_config),
             config.min_context_slot,
         )?;

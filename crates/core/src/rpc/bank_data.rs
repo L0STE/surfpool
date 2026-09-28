@@ -466,11 +466,7 @@ impl BankData for SurfpoolBankDataRpc {
         let svm_locker = meta.get_svm_locker()?;
         let config = config.unwrap_or_default();
 
-        context_slot(
-            svm_locker.get_latest_absolute_slot(),
-            config.commitment,
-            config.min_context_slot,
-        )?;
+        context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
 
         Ok(SURFPOOL_IDENTITY_PUBKEY.to_string())
     }

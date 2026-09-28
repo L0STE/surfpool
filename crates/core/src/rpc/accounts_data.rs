@@ -376,11 +376,7 @@ impl AccountsData for SurfpoolAccountsDataRpc {
         };
 
         Box::pin(async move {
-            let slot = context_slot(
-                svm_locker.get_latest_absolute_slot(),
-                config.commitment,
-                config.min_context_slot,
-            )?;
+            let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
             let SvmAccessContext {
                 inner: account_update,
                 ..
@@ -442,11 +438,7 @@ impl AccountsData for SurfpoolAccountsDataRpc {
         let rpc_start = std::time::Instant::now();
 
         Box::pin(async move {
-            let slot = context_slot(
-                svm_locker.get_latest_absolute_slot(),
-                config.commitment,
-                config.min_context_slot,
-            )?;
+            let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
             let SvmAccessContext {
                 inner: account_updates,
                 ..

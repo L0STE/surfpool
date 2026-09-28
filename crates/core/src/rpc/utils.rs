@@ -28,7 +28,7 @@ use solana_transaction_status::{
 
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
-    surfnet::slot_for_commitment,
+    surfnet::{locker::SurfnetSvmLocker, slot_for_commitment},
 };
 
 /// Returns the slot a read at `commitment` answers for, judged before the read.
@@ -38,12 +38,12 @@ use crate::{
 /// state and never rolls it back, so a value read afterwards reflects every transaction up to
 /// this slot, and may already reflect later ones.
 pub fn context_slot(
-    latest_absolute_slot: Slot,
+    svm_locker: &SurfnetSvmLocker,
     commitment: Option<CommitmentConfig>,
     min_context_slot: Option<Slot>,
 ) -> Result<Slot> {
     let slot = slot_for_commitment(
-        latest_absolute_slot,
+        svm_locker.get_latest_absolute_slot(),
         commitment.unwrap_or_default().commitment,
     );
     match min_context_slot {
