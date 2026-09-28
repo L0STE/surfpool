@@ -4709,6 +4709,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(full.rewards, Some(vec![]));
+        assert_eq!(full.signatures, None);
         let full_signatures: Vec<String> = full
             .transactions
             .unwrap()
@@ -4758,6 +4759,36 @@ mod tests {
                 .iter()
                 .all(|tx| { tx.meta.as_ref().unwrap().rewards == OptionSerializer::None })
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_block_signatures_come_from_block_header() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        insert_test_blocks(&setup, 100..=110);
+        // A header signature with no stored transaction record.
+        let signature = Signature::new_unique();
+        setup.context.svm_locker.with_svm_writer(|svm_writer| {
+            let mut header = svm_writer.blocks.get(&100).unwrap().unwrap();
+            header.signatures = vec![signature];
+            svm_writer.blocks.store(100, header).unwrap();
+        });
+
+        let block = setup
+            .rpc
+            .get_block(
+                Some(setup.context.clone()),
+                100,
+                Some(RpcEncodingConfigWrapper::Current(Some(RpcBlockConfig {
+                    transaction_details: Some(TransactionDetails::Signatures),
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    ..RpcBlockConfig::default()
+                }))),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(block.transactions, None);
+        assert_eq!(block.signatures, Some(vec![signature.to_string()]));
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -3596,9 +3596,11 @@ impl SurfnetSvm {
         };
 
         let transaction_details = config.transaction_details.unwrap_or_default();
+        // Signatures mode answers from the block header, so a missing tx record
+        // cannot drop a signature and no transaction is loaded.
         let transactions = match transaction_details {
-            TransactionDetails::None => vec![],
-            _ => block
+            TransactionDetails::None | TransactionDetails::Signatures => vec![],
+            TransactionDetails::Full | TransactionDetails::Accounts => block
                 .signatures
                 .iter()
                 .filter_map(|sig| self.transactions.get(&sig.to_string()).ok().flatten())
@@ -3609,7 +3611,9 @@ impl SurfnetSvm {
                 .collect(),
         };
 
-        let block = ConfirmedBlock {
+        let signatures = matches!(transaction_details, TransactionDetails::Signatures)
+            .then(|| block.signatures.iter().map(ToString::to_string).collect());
+        let mut block = ConfirmedBlock {
             previous_blockhash: block.previous_blockhash,
             blockhash: block.hash,
             parent_slot: block.parent_slot,
@@ -3627,6 +3631,7 @@ impl SurfnetSvm {
                 max_supported_transaction_version: config.max_supported_transaction_version,
             },
         )?;
+        block.signatures = signatures;
         Ok(Some(block))
     }
 
