@@ -200,9 +200,8 @@ impl SomeRemoteCtx for Option<SurfnetRemoteClient> {
     }
 }
 
-/// `minContextSlot` names a slot of this surfnet, which the datasource never produced. The
-/// surfnet judges it against its own slot before answering, so it is not forwarded.
-fn for_datasource(config: &RpcAccountInfoConfig) -> RpcAccountInfoConfig {
+/// Clears `min_context_slot` from [RpcAccountInfoConfig], since this value is only relevant against the local surfnet, not the upstream.
+fn clear_min_context_slot(config: &RpcAccountInfoConfig) -> RpcAccountInfoConfig {
     RpcAccountInfoConfig {
         min_context_slot: None,
         ..config.clone()
@@ -498,7 +497,7 @@ impl SurfnetRemoteClient {
                 json!([
                     owner.to_string(),
                     token_account_filter,
-                    for_datasource(config)
+                    clear_min_context_slot(config)
                 ]),
             )
             .await;
@@ -557,7 +556,7 @@ impl SurfnetRemoteClient {
                 json!([
                     delegate.to_string(),
                     token_account_filter,
-                    for_datasource(config)
+                    clear_min_context_slot(config)
                 ]),
             )
             .await;
@@ -579,7 +578,7 @@ impl SurfnetRemoteClient {
                     RpcProgramAccountsConfig {
                         filters,
                         with_context: Some(false),
-                        account_config: for_datasource(&account_config),
+                        account_config: clear_min_context_slot(&account_config),
                         ..Default::default()
                     },
                 )
