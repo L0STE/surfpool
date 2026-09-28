@@ -5,6 +5,7 @@ use jsonrpc_derive::rpc;
 use sha2::{Digest, Sha256};
 use solana_account_decoder::{UiAccount, UiAccountEncoding, encode_ui_account};
 use solana_client::{rpc_config::RpcSendTransactionConfig, rpc_custom_error::RpcCustomError};
+use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{Response as RpcResponse, RpcBlockhash, RpcResponseContext};
 use solana_signature::Signature;
@@ -16,7 +17,10 @@ use surfpool_types::{
     TransactionStatusEvent,
 };
 
-use super::{RunloopContext, utils::decode_and_deserialize};
+use super::{
+    RunloopContext,
+    utils::{context_slot, decode_and_deserialize},
+};
 use crate::{
     rpc::full::SurfpoolFullRpc,
     surfnet::{locker::SurfnetSvmLocker, svm::BundleSandbox},
@@ -277,6 +281,12 @@ impl Jito for SurfpoolJitoRpc {
             };
 
             let base_config = config.unwrap_or_default();
+            // Bundles skip preflight, so they run against the processed slot.
+            context_slot(
+                ctx.svm_locker.get_latest_absolute_slot(),
+                Some(CommitmentConfig::processed()),
+                base_config.min_context_slot,
+            )?;
 
             // Decode all bundle transactions up front so we can run them against an isolated
             // sandbox.
