@@ -3145,8 +3145,20 @@ impl SurfnetSvm {
                 // Mints fail the token unpack and keep flowing through the IDL path.
                 if is_supported_token_program(account.owner()) {
                     if let Ok(token_account) = TokenAccount::unpack(account.data()) {
-                        let new_account_data =
-                            forge_token_account_data(&account, token_account, &account_values)?;
+                        let new_account_data = match forge_token_account_data(
+                            &account,
+                            token_account,
+                            &account_values,
+                        ) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                warn!(
+                                    "Failed to forge token account data for {} (override {}): {}",
+                                    account_pubkey, override_instance.id, e
+                                );
+                                continue;
+                            }
+                        };
                         let modified_account = Account {
                             lamports: account.lamports(),
                             data: new_account_data,
@@ -3154,7 +3166,10 @@ impl SurfnetSvm {
                             executable: account.executable(),
                             rent_epoch: account.rent_epoch(),
                         };
-                        self.set_account(&account_pubkey, modified_account)?;
+                        if let Err(e) = self.set_account(&account_pubkey, modified_account) {
+                            restore_unprocessed(self, index);
+                            return Err(e);
+                        }
                         continue;
                     }
                 }
@@ -7866,6 +7881,58 @@ mod tests {
             .map(|(pubkey, account)| (pubkey, account.amount()))
             .collect::<Vec<_>>();
         assert_eq!(amounts, vec![(token_account, 500)]);
+    }
+
+    /// An override whose values cannot be applied is skipped, like an IDL override that fails to
+    /// forge, and the overrides after it in the same slot still apply.
+    #[tokio::test]
+    async fn a_bad_token_override_does_not_drop_the_overrides_after_it() {
+        const SLOT: u64 = 500;
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (mint, token_account) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let mut data = vec![0; TokenAccount::LEN];
+        TokenAccount {
+            mint,
+            owner: Pubkey::new_unique(),
+            state: AccountState::Initialized,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut data);
+        svm.set_account(
+            &token_account,
+            Account {
+                lamports: 2_039_280,
+                data,
+                owner: spl_token_interface::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        let set_amount = |amount| {
+            surfpool_types::OverrideInstance::new(
+                "token-amount".to_string(),
+                0,
+                surfpool_types::AccountAddress::Pubkey(token_account.to_string()),
+            )
+            .with_values(HashMap::from([("amount".to_string(), amount)]))
+        };
+        svm.scheduled_overrides
+            .store(
+                SLOT,
+                vec![
+                    set_amount(serde_json::json!("not an amount")),
+                    set_amount(serde_json::json!(500u64)),
+                ],
+            )
+            .unwrap();
+
+        let materialized = svm.materialize_overrides_for_slot(&None, SLOT).await;
+
+        let amount = TokenAccount::unpack(&svm.get_account(&token_account).unwrap().unwrap().data)
+            .unwrap()
+            .amount;
+        assert_eq!((materialized.is_ok(), amount), (true, 500));
     }
 
     /// An override that rewrites an account through its IDL notifies the account's subscribers,
