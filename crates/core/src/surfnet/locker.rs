@@ -4,18 +4,17 @@ use std::{
     time::SystemTime,
 };
 
-use bincode::serialized_size;
 use crossbeam_channel::{Receiver, Sender};
 use itertools::Itertools;
 use litesvm::types::{
     FailedTransactionMetadata, SimulatedTransactionInfo, TransactionMetadata, TransactionResult,
 };
-use solana_account::{Account, ReadableAccount};
+use solana_account::{Account, ReadableAccount, state_traits::StateMut};
 use solana_account_decoder::{
     UiAccount, UiAccountEncoding, UiDataSliceConfig,
     parse_account_data::AccountAdditionalDataV3,
     parse_bpf_loader::{BpfUpgradeableLoaderAccountType, UiProgram, parse_bpf_upgradeable_loader},
-    parse_token::{UiTokenAmount, real_number_string_trimmed},
+    parse_token::token_amount_to_ui_amount_v3,
 };
 use solana_address_lookup_table_interface::state::AddressLookupTable;
 use solana_client::{
@@ -34,6 +33,7 @@ use solana_client::{
 use solana_clock::{Clock, Slot, UnixTimestamp};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_epoch_info::EpochInfo;
+use solana_epoch_schedule::EpochSchedule;
 use solana_hash::Hash;
 use solana_loader_v3_interface::{get_program_data_address, state::UpgradeableLoaderState};
 use solana_message::{
@@ -52,6 +52,7 @@ use solana_transaction_status::{
     TransactionTokenBalance, UiConfirmedBlock, UiTransactionEncoding,
     VersionedTransactionWithStatusMeta, extract_and_fmt_memos,
 };
+use spl_token_2022_interface::generic_token_account::GenericTokenAccount;
 use surfpool_types::{
     AccountSnapshot, ComputeUnitsEstimationResult, ExecutionCapture, ExportSnapshotConfig, Idl,
     KeyedProfileResult, ProfileResult, RpcProfileResultConfig, RunbookExecutionStatusReport,
@@ -1625,15 +1626,6 @@ impl SurfnetSvmLocker {
         pubkey: &Pubkey,
         config: Option<&RpcSignaturesForAddressConfig>,
     ) -> SurfpoolContextualizedResult<Vec<RpcConfirmedTransactionStatusWithSignature>> {
-        let limit = config
-            .and_then(|config| config.limit)
-            .unwrap_or(MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT);
-        if limit == 0 || limit > MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT {
-            return Err(SurfpoolError::invalid_params(format!(
-                "Invalid limit; max {MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT}"
-            )));
-        }
-
         let results = if let Some((remote_client, _)) = remote_ctx {
             self.get_signatures_for_address_local_then_remote(remote_client, pubkey, config)
                 .await?
@@ -3068,29 +3060,14 @@ impl SurfnetSvmLocker {
         self.with_contextualized_svm_reader(|svm_reader| {
             let token_accounts = svm_reader.get_token_accounts_by_mint(mint);
 
-            // get mint information to determine decimals
-            let mint_decimals = if let Some(mint_account) =
-                svm_reader.token_mints.get(&mint.to_string()).ok().flatten()
-            {
-                mint_account.decimals()
-            } else {
-                0
-            };
+            let mint_data = svm_reader.mint_additional_data(mint).unwrap_or_default();
 
             // convert to RpcTokenAccountBalance and sort by balance
             let mut balances: Vec<RpcTokenAccountBalance> = token_accounts
                 .into_iter()
                 .map(|(pubkey, token_account)| RpcTokenAccountBalance {
                     address: pubkey.to_string(),
-                    amount: UiTokenAmount {
-                        amount: token_account.amount().to_string(),
-                        decimals: mint_decimals,
-                        ui_amount: format_ui_amount(token_account.amount(), mint_decimals),
-                        ui_amount_string: real_number_string_trimmed(
-                            token_account.amount(),
-                            mint_decimals,
-                        ),
-                    },
+                    amount: token_amount_to_ui_amount_v3(token_account.amount(), &mint_data),
                 })
                 .collect();
 
@@ -3718,12 +3695,10 @@ impl SurfnetSvmLocker {
 
             let mut filtered = vec![];
             for (pubkey, account) in &res {
-                if let Some(ref active_filters) = filters {
-                    match apply_rpc_filters(&account.data, active_filters) {
-                        Ok(true) => {}           // Account matches all filters
-                        Ok(false) => continue,   // Filtered out
-                        Err(e) => return Err(e), // Error applying filter, already JsonRpcError
-                    }
+                if let Some(ref active_filters) = filters
+                    && !apply_rpc_filters(&account.data, active_filters)
+                {
+                    continue;
                 }
 
                 filtered.push(svm_reader.account_to_rpc_keyed_account(
@@ -3733,7 +3708,7 @@ impl SurfnetSvmLocker {
                     None,
                 ));
             }
-            Ok(filtered)
+            Ok::<_, SurfpoolError>(filtered)
         })?;
 
         Ok(self.with_contextualized_svm_reader(|_| res.clone()))
@@ -3910,17 +3885,24 @@ impl SurfnetSvmLocker {
         simnet_command_tx: Sender<SimnetCommand>,
         config: TimeTravelConfig,
     ) -> SurfpoolResult<EpochInfo> {
-        let (epoch_info, slot_time, updated_at) = self.with_svm_reader(|svm_reader| {
-            (
-                svm_reader.latest_epoch_info.clone(),
-                svm_reader.slot_time,
-                svm_reader.updated_at,
-            )
-        });
+        let (epoch_info, epoch_schedule, slot_time, updated_at) =
+            self.with_svm_reader(|svm_reader| {
+                (
+                    svm_reader.latest_epoch_info.clone(),
+                    svm_reader.inner.get_sysvar::<EpochSchedule>(),
+                    svm_reader.slot_time,
+                    svm_reader.updated_at,
+                )
+            });
 
-        let clock_update: Clock =
-            calculate_time_travel_clock(&config, updated_at, slot_time, &epoch_info)
-                .map_err(|e| SurfpoolError::internal(e.to_string()))?;
+        let clock_update: Clock = calculate_time_travel_clock(
+            &config,
+            updated_at,
+            slot_time,
+            &epoch_info,
+            &epoch_schedule,
+        )
+        .map_err(|e| SurfpoolError::internal(e.to_string()))?;
 
         let formated_time = chrono::DateTime::from_timestamp(clock_update.unix_timestamp, 0)
             .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap())
@@ -4461,10 +4443,6 @@ impl SurfnetSvmLocker {
             }
         };
 
-        let metadata_bytes = bincode::serialize(&new_metadata).map_err(|e| {
-            SurfpoolError::internal(format!("Failed to serialize program data metadata: {}", e))
-        })?;
-
         // Strip the minimum_program.so placeholder if it was pre-filled by
         // init_programdata_account during program account creation. This prevents
         // leftover placeholder bytes when the actual program is smaller than 3312 bytes.
@@ -4499,7 +4477,9 @@ impl SurfnetSvmLocker {
         }
 
         // Write the metadata
-        program_data_account.data[..metadata_size].copy_from_slice(&metadata_bytes);
+        program_data_account.set_state(&new_metadata).map_err(|e| {
+            SurfpoolError::internal(format!("Failed to serialize program data metadata: {}", e))
+        })?;
         // Write data at the specified offset
         program_data_account.data[absolute_offset..end_offset].copy_from_slice(&data);
 
@@ -4521,31 +4501,15 @@ impl SurfnetSvmLocker {
 }
 
 // Helper function to apply filters
-pub(crate) fn apply_rpc_filters(
-    account_data: &[u8],
-    filters: &[RpcFilterType],
-) -> SurfpoolResult<bool> {
-    for filter in filters {
-        match filter {
-            RpcFilterType::DataSize(size) => {
-                if account_data.len() as u64 != *size {
-                    return Ok(false);
-                }
-            }
-            RpcFilterType::Memcmp(memcmp_filter) => {
-                // Use the public bytes_match method from solana_client::rpc_filter::Memcmp
-                if !memcmp_filter.bytes_match(account_data) {
-                    return Ok(false); // Content mismatch or out of bounds handled by bytes_match
-                }
-            }
-            RpcFilterType::TokenAccountState => {
-                return Err(SurfpoolError::internal(
-                    "TokenAccountState filter is not supported",
-                ));
-            }
+// Mirrors Agave's `rpc/src/filter.rs` `filter_allows`.
+pub(crate) fn apply_rpc_filters(account_data: &[u8], filters: &[RpcFilterType]) -> bool {
+    filters.iter().all(|filter| match filter {
+        RpcFilterType::DataSize(size) => account_data.len() as u64 == *size,
+        RpcFilterType::Memcmp(compare) => compare.bytes_match(account_data),
+        RpcFilterType::TokenAccountState => {
+            spl_token_2022_interface::state::Account::valid_account_data(account_data)
         }
-    }
-    Ok(true)
+    })
 }
 
 // used in the remote.rs
@@ -4570,27 +4534,17 @@ fn update_programdata_account(
         slot,
     } = upgradeable_loader_state
     {
-        let offset = if upgrade_authority_address.is_some() {
-            UpgradeableLoaderState::size_of_programdata_metadata()
-        } else {
-            UpgradeableLoaderState::size_of_programdata_metadata()
-                - serialized_size(&Pubkey::default()).unwrap() as usize
-        };
-
-        let mut data = bincode::serialize(&UpgradeableLoaderState::ProgramData {
-            upgrade_authority_address: new_authority,
-            slot,
-        })
-        .map_err(|e| {
-            SurfpoolError::invalid_program_account(
-                program_id,
-                format!("Failed to serialize program data: {}", e),
-            )
-        })?;
-
-        data.append(&mut programdata_account.data[offset..].to_vec());
-
-        programdata_account.data = data;
+        programdata_account
+            .set_state(&UpgradeableLoaderState::ProgramData {
+                upgrade_authority_address: new_authority,
+                slot,
+            })
+            .map_err(|e| {
+                SurfpoolError::invalid_program_account(
+                    program_id,
+                    format!("Failed to serialize program data: {}", e),
+                )
+            })?;
 
         Ok(upgrade_authority_address)
     } else {
@@ -4599,15 +4553,6 @@ fn update_programdata_account(
             "Invalid program data account",
         ))
     }
-}
-
-/// Scales a raw token amount by its mint's decimals for `UiTokenAmount::ui_amount`.
-///
-/// `None` when `decimals` is too large for `10^decimals` to fit a `usize`.
-pub fn format_ui_amount(amount: u64, decimals: u8) -> Option<f64> {
-    10_usize
-        .checked_pow(decimals as u32)
-        .map(|divisor| amount as f64 / divisor as f64)
 }
 
 #[cfg(test)]
@@ -4622,7 +4567,7 @@ mod tests {
 
     use async_trait::async_trait;
     use solana_account::Account;
-    use solana_account_decoder::UiAccountEncoding;
+    use solana_account_decoder::{UiAccountEncoding, parse_token::UiTokenAmount};
     use solana_client::{
         nonblocking::rpc_client::RpcClient, rpc_client::RpcClientConfig, rpc_request::RpcRequest,
     };
@@ -7201,15 +7146,5 @@ mod tests {
             .expect("cached genesis hash should not require the remote RPC");
 
         assert_eq!(result.inner, expected_hash);
-    }
-
-    #[test]
-    fn test_format_ui_amount_scales_by_decimals() {
-        assert_eq!(format_ui_amount(0, 0), Some(0.0));
-        assert_eq!(format_ui_amount(1_500_000, 6), Some(1.5));
-        assert_eq!(format_ui_amount(42, 0), Some(42.0));
-        // `Mint::decimals` is an unvalidated u8; 10^decimals stops fitting a usize well
-        // before 255, and the field is Option<f64> so those mints have somewhere to land.
-        assert_eq!(format_ui_amount(1, 255), None);
     }
 }

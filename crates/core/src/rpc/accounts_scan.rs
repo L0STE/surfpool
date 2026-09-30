@@ -7,7 +7,6 @@ use solana_client::{
         RpcAccountInfoConfig, RpcLargestAccountsConfig, RpcProgramAccountsConfig, RpcSupplyConfig,
         RpcTokenAccountsFilter,
     },
-    rpc_request::TokenAccountsFilter,
     rpc_response::{
         OptionalContext, RpcAccountBalance, RpcKeyedAccount, RpcResponseContext, RpcSupply,
         RpcTokenAccountBalance,
@@ -18,7 +17,9 @@ use solana_rpc_client_api::response::Response as RpcResponse;
 
 use super::{
     RunloopContext, State, SurfnetRpcContext,
-    utils::{context_slot, verify_pubkey},
+    utils::{
+        context_slot, optimize_filters, verify_filters, verify_pubkey, verify_token_account_filter,
+    },
 };
 use crate::surfnet::locker::SvmAccessContext;
 
@@ -484,6 +485,12 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
         };
 
         Box::pin(async move {
+            let mut filters = config.filters;
+            if let Some(filters) = filters.as_mut() {
+                verify_filters(filters)?;
+                optimize_filters(filters);
+            }
+
             let account_config = config.account_config;
             let slot = context_slot(
                 &svm_locker,
@@ -497,7 +504,7 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
                     &remote_ctx.map(|(client, _)| client),
                     &program_id,
                     account_config,
-                    config.filters,
+                    filters,
                 )
                 .await?
                 .inner;
@@ -626,23 +633,6 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
             Err(e) => return e.into(),
         };
 
-        let filter = match token_account_filter {
-            RpcTokenAccountsFilter::Mint(mint_str) => {
-                let mint = match verify_pubkey(&mint_str) {
-                    Ok(res) => res,
-                    Err(e) => return e.into(),
-                };
-                TokenAccountsFilter::Mint(mint)
-            }
-            RpcTokenAccountsFilter::ProgramId(program_id_str) => {
-                let program_id = match verify_pubkey(&program_id_str) {
-                    Ok(res) => res,
-                    Err(e) => return e.into(),
-                };
-                TokenAccountsFilter::ProgramId(program_id)
-            }
-        };
-
         let SurfnetRpcContext {
             svm_locker,
             remote_ctx,
@@ -653,6 +643,7 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
 
         Box::pin(async move {
             let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
+            let filter = verify_token_account_filter(token_account_filter)?;
             let SvmAccessContext {
                 inner: token_accounts,
                 ..
@@ -694,14 +685,7 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
         };
 
         Box::pin(async move {
-            let filter = match token_account_filter {
-                RpcTokenAccountsFilter::Mint(mint_str) => {
-                    TokenAccountsFilter::Mint(verify_pubkey(&mint_str)?)
-                }
-                RpcTokenAccountsFilter::ProgramId(program_id_str) => {
-                    TokenAccountsFilter::ProgramId(verify_pubkey(&program_id_str)?)
-                }
-            };
+            let filter = verify_token_account_filter(token_account_filter)?;
 
             let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
             let remote_ctx = remote_ctx.map(|(r, _)| r);
@@ -727,13 +711,14 @@ mod tests {
     use std::str::FromStr;
 
     use itertools::Itertools;
+    use jsonrpc_core::ErrorCode;
     use solana_account::Account;
     use solana_client::{
         rpc_config::{
             RpcAccountInfoConfig, RpcLargestAccountsConfig, RpcLargestAccountsFilter,
             RpcProgramAccountsConfig, RpcSupplyConfig, RpcTokenAccountsFilter,
         },
-        rpc_filter::{Memcmp, RpcFilterType},
+        rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType},
         rpc_response::OptionalContext,
     };
     use solana_commitment_config::CommitmentConfig;
@@ -899,6 +884,93 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_program_accounts_rejects_invalid_filters() {
+        let setup = TestSetup::new(SurfpoolAccountsScanRpc);
+        let owner = Pubkey::new_unique();
+        let bad_memcmp = |bytes: String| {
+            RpcFilterType::Memcmp(Memcmp::new(1, MemcmpEncodedBytes::Base58(bytes)))
+        };
+
+        for filters in [
+            vec![RpcFilterType::DataSize(3); 5],
+            vec![bad_memcmp("0OIl".to_string())],
+            vec![bad_memcmp("1".repeat(200))],
+        ] {
+            let err = setup
+                .rpc
+                .get_program_accounts(
+                    Some(setup.context.clone()),
+                    owner.to_string(),
+                    Some(RpcProgramAccountsConfig {
+                        filters: Some(filters.clone()),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect_err(&format!("filters {filters:?} should be rejected"));
+            assert_eq!(err.code, ErrorCode::InvalidParams);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_program_accounts_token_account_state_filter() {
+        let setup = TestSetup::new(SurfpoolAccountsScanRpc);
+        let initialized = Pubkey::new_unique();
+        let uninitialized = Pubkey::new_unique();
+
+        let mut data = vec![0u8; TokenAccount::LEN];
+        TokenAccount {
+            mint: Pubkey::new_unique(),
+            owner: Pubkey::new_unique(),
+            amount: 1,
+            state: spl_token_interface::state::AccountState::Initialized,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut data);
+
+        setup.context.svm_locker.with_svm_writer(|svm_writer| {
+            for (pubkey, data) in [
+                (initialized, data),
+                (uninitialized, vec![0u8; TokenAccount::LEN]),
+            ] {
+                svm_writer
+                    .set_account(
+                        &pubkey,
+                        Account {
+                            lamports: 1_000_000,
+                            data,
+                            owner: spl_token_interface::ID,
+                            executable: false,
+                            rent_epoch: 0,
+                        },
+                    )
+                    .unwrap();
+            }
+        });
+
+        let res = setup
+            .rpc
+            .get_program_accounts(
+                Some(setup.context.clone()),
+                spl_token_interface::ID.to_string(),
+                Some(RpcProgramAccountsConfig {
+                    filters: Some(vec![
+                        RpcFilterType::TokenAccountState,
+                        RpcFilterType::DataSize(TokenAccount::LEN as u64),
+                    ]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("tokenAccountState filter should be supported");
+        let OptionalContext::NoContext(value) = res else {
+            panic!("Expected no context");
+        };
+        let pubkeys = value.iter().map(|a| a.pubkey.clone()).collect::<Vec<_>>();
+        assert_eq!(pubkeys, vec![initialized.to_string()]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
