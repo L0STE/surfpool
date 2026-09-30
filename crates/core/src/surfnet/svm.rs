@@ -40,7 +40,7 @@ use solana_inflation::Inflation;
 use solana_loader_v3_interface::state::UpgradeableLoaderState;
 use solana_message::{
     Message, SanitizedMessage, SanitizedVersionedMessage, SimpleAddressLoader, VersionedMessage,
-    inline_nonce::is_advance_nonce_instruction_data, v0::LoadedAddresses,
+    v0::LoadedAddresses,
 };
 use solana_program_option::COption;
 use solana_pubkey::Pubkey;
@@ -1847,9 +1847,8 @@ impl SurfnetSvm {
         self.inner.svm.get_fee_structure().lamports_per_signature
     }
 
-    /// Validates the blockhash of a transaction, considering nonce accounts if present.
-    /// If the transaction uses a nonce account, the blockhash is validated against the nonce account's stored blockhash.
-    /// Otherwise, it is validated against the RecentBlockhashes sysvar.
+    /// Validates a transaction's lifetime as Agave's `check_transactions` does: a recent blockhash,
+    /// or else a durable nonce.
     ///
     /// # Arguments
     /// * `tx` - The transaction to validate.
@@ -1857,75 +1856,44 @@ impl SurfnetSvm {
     /// # Returns
     /// `true` if the transaction blockhash is valid, `false` otherwise.
     pub fn validate_transaction_blockhash(&self, tx: &VersionedTransaction) -> bool {
-        if self.skip_blockhash_check {
-            return true;
-        }
+        self.skip_blockhash_check
+            || self.check_blockhash_is_recent(tx.message.recent_blockhash())
+            || self.check_durable_nonce(&tx.message)
+    }
 
-        let recent_blockhash = tx.message.recent_blockhash();
-
-        let some_nonce_account_index = tx
-            .message
-            .instructions()
-            .get(solana_nonce::NONCED_TX_MARKER_IX_INDEX as usize)
-            .filter(|instruction| {
-                matches!(
-                    tx.message.static_account_keys().get(instruction.program_id_index as usize),
-                    Some(program_id) if system_program::check_id(program_id)
-                ) && is_advance_nonce_instruction_data(&instruction.data)
+    /// Agave's strict `check_nonce_account`: the nonce account is a system-owned, current-version
+    /// nonce holding the message's blockhash, and its authority signed the advance instruction.
+    ///
+    /// V0 lookup tables are left unresolved, so a nonce account loaded from one is not found.
+    fn check_durable_nonce(&self, message: &VersionedMessage) -> bool {
+        let Some(message) = SanitizedVersionedMessage::try_from(message.clone())
+            .ok()
+            .and_then(|message| {
+                SanitizedMessage::try_new(
+                    message,
+                    SimpleAddressLoader::Enabled(LoadedAddresses::default()),
+                    &agave_reserved_account_keys::ReservedAccountKeys::new_all_activated().active,
+                )
+                .ok()
             })
-            .map(|instruction| {
-                // nonce account is the first account in the instruction
-                instruction.accounts.get(0)
-            });
-
-        debug!(
-            "Validating tx blockhash: {}; is nonce tx?: {}",
-            recent_blockhash,
-            some_nonce_account_index.is_some()
-        );
-
-        if let Some(nonce_account_index) = some_nonce_account_index {
-            trace!(
-                "Nonce tx detected. Nonce account index: {:?}",
-                nonce_account_index
-            );
-            let Some(nonce_account_index) = nonce_account_index else {
-                return false;
-            };
-
-            let Some(nonce_account_pubkey) = tx
-                .message
-                .static_account_keys()
-                .get(*nonce_account_index as usize)
-            else {
-                return false;
-            };
-
-            trace!("Nonce account pubkey: {:?}", nonce_account_pubkey,);
-
-            // Here we're swallowing errors in the storage - if we fail to fetch the account because of a storage error,
-            // we're just considering the blockhash to be invalid.
-            let Ok(Some(nonce_account)) = self.get_account(nonce_account_pubkey) else {
-                return false;
-            };
-            trace!("Nonce account: {:?}", nonce_account);
-
-            let Some(nonce_data) =
-                bincode::deserialize::<solana_nonce::versions::Versions>(&nonce_account.data).ok()
-            else {
-                return false;
-            };
-            trace!("Nonce account data: {:?}", nonce_data);
-
-            let nonce_state = nonce_data.state();
-            let initialized_state = match nonce_state {
-                solana_nonce::state::State::Uninitialized => return false,
-                solana_nonce::state::State::Initialized(data) => data,
-            };
-            return initialized_state.blockhash() == *recent_blockhash;
-        } else {
-            self.check_blockhash_is_recent(recent_blockhash)
-        }
+        else {
+            return false;
+        };
+        message
+            .get_durable_nonce()
+            .and_then(|address| self.get_account(address).ok().flatten())
+            .filter(|account| account.data.len() == solana_nonce::state::State::size())
+            .and_then(|account| {
+                solana_nonce_account::verify_nonce_account(
+                    &account.into(),
+                    message.recent_blockhash(),
+                )
+            })
+            .is_some_and(|nonce| {
+                message
+                    .get_ix_signers(solana_nonce::NONCED_TX_MARKER_IX_INDEX as usize)
+                    .any(|signer| signer == &nonce.authority)
+            })
     }
 
     /// Verifies the signature of a transaction and validates that it hasn't already been processed.
@@ -6113,6 +6081,142 @@ mod tests {
             "send should succeed when skip_blockhash_check is enabled: {:?}",
             send_result.err().map(|err| err.err)
         );
+    }
+
+    /// Sends a lone `AdvanceNonceAccount`, whose authority is not the fee payer, over a fresh nonce
+    /// account, once `tamper` has edited that account and the instruction. Signs over the stored
+    /// nonce, or over the live blockhash. A `versioned` send is a v0 message that also transfers
+    /// to an account loaded from a lookup table. Returns the SVM, the nonce address, the stored
+    /// nonce and the outcome.
+    fn send_advance_nonce(
+        live_blockhash: bool,
+        versioned: bool,
+        tamper: fn(&mut Account, &mut solana_instruction::Instruction),
+    ) -> (SurfnetSvm, Pubkey, Hash, Result<(), TransactionError>) {
+        use solana_nonce::{
+            state::{Data, DurableNonce, State},
+            versions::Versions,
+        };
+
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (payer, authority, nonce) = (Keypair::new(), Keypair::new(), Pubkey::new_unique());
+        svm.airdrop(&payer.pubkey(), 1_000_000_000)
+            .unwrap()
+            .unwrap();
+
+        let stored = DurableNonce::from_blockhash(&Hash::new_unique());
+        let state = State::Initialized(Data::new(authority.pubkey(), stored, 5_000));
+        let mut account = Account {
+            lamports: 1_000_000_000,
+            data: bincode::serialize(&Versions::new(state)).unwrap(),
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        let mut advance = system_instruction::advance_nonce_account(&nonce, &authority.pubkey());
+        tamper(&mut account, &mut advance);
+        svm.set_account(&nonce, account).unwrap();
+
+        let blockhash = if live_blockhash {
+            svm.latest_blockhash()
+        } else {
+            *stored.as_hash()
+        };
+        let message = if versioned {
+            use solana_address_lookup_table_interface::state::{
+                AddressLookupTable, LookupTableMeta,
+            };
+
+            let (table, recipient) = (Pubkey::new_unique(), Pubkey::new_unique());
+            let lookup_table = AddressLookupTable {
+                meta: LookupTableMeta::default(),
+                addresses: vec![recipient].into(),
+            };
+            svm.set_account(
+                &table,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: lookup_table.serialize_for_tests().unwrap(),
+                    owner: solana_address_lookup_table_interface::program::id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+            let transfer = system_instruction::transfer(&payer.pubkey(), &recipient, 1_000_000);
+            let message = solana_message::v0::Message::try_compile(
+                &payer.pubkey(),
+                &[advance, transfer],
+                &[solana_message::AddressLookupTableAccount {
+                    key: table,
+                    addresses: vec![recipient],
+                }],
+                blockhash,
+            )
+            .unwrap();
+            assert_eq!(message.address_table_lookups[0].writable_indexes, [0]);
+            VersionedMessage::V0(message)
+        } else {
+            VersionedMessage::Legacy(Message::new_with_blockhash(
+                &[advance],
+                Some(&payer.pubkey()),
+                &blockhash,
+            ))
+        };
+        let static_keys = message.static_account_keys();
+        let signers: Vec<&Keypair> = [&payer, &authority]
+            .into_iter()
+            .filter(|signer| {
+                static_keys[..message.header().num_required_signatures as usize]
+                    .contains(&signer.pubkey())
+            })
+            .collect();
+        let tx = VersionedTransaction::try_new(message, &signers).unwrap();
+        let result = svm
+            .send_transaction(tx, false, false)
+            .map(|_| ())
+            .map_err(|e| e.err);
+        (svm, nonce, *stored.as_hash(), result)
+    }
+
+    #[test_case(false; "signed over the stored nonce")]
+    #[test_case(true; "signed over a live blockhash")]
+    fn test_durable_nonce_transaction_is_accepted_and_advances_the_nonce(live_blockhash: bool) {
+        for versioned in [false, true] {
+            let (svm, nonce, stored, result) =
+                send_advance_nonce(live_blockhash, versioned, |_, _| {});
+
+            assert_eq!(result, Ok(()), "versioned: {versioned}");
+            let account = svm.get_account(&nonce).unwrap().unwrap();
+            let versions: solana_nonce::versions::Versions =
+                bincode::deserialize(&account.data).unwrap();
+            assert!(
+                matches!(
+                    versions.state(),
+                    solana_nonce::state::State::Initialized(data) if data.blockhash() != stored
+                ),
+                "versioned: {versioned}"
+            );
+        }
+    }
+
+    #[test_case(|account, _| account.owner = Pubkey::new_unique(); "nonce account not owned by the system program")]
+    #[test_case(|account, _| account.data[..4].copy_from_slice(&0u32.to_le_bytes()); "legacy nonce version")]
+    #[test_case(|account, _| account.data.push(0); "nonce account larger than a nonce")]
+    #[test_case(|_, advance| advance.accounts[0].is_writable = false; "nonce account not writable")]
+    #[test_case(|_, advance| advance.accounts[2].is_signer = false; "nonce authority did not sign")]
+    fn test_invalid_durable_nonce_transaction_is_rejected(
+        tamper: fn(&mut Account, &mut solana_instruction::Instruction),
+    ) {
+        for versioned in [false, true] {
+            let (_svm, _nonce, _stored, result) = send_advance_nonce(false, versioned, tamper);
+
+            assert_eq!(
+                result,
+                Err(TransactionError::BlockhashNotFound),
+                "versioned: {versioned}"
+            );
+        }
     }
 
     // Feature configuration tests

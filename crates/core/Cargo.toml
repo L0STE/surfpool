@@ -68,6 +68,7 @@ solana-keypair = { workspace = true }
 solana-loader-v3-interface = { workspace = true }
 solana-message = { workspace = true }
 solana-nonce = { workspace = true }
+solana-nonce-account = { workspace = true }
 solana-packet = { workspace = true }
 solana-program-option = { workspace = true }
 solana-program-pack = { workspace = true }
