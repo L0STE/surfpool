@@ -467,11 +467,7 @@ pub async fn start_block_production_runloop(
                         svm_locker.with_svm_writer(|svm_writer| {
                             svm_writer.inner.set_sysvar(&clock);
                             svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
-                            svm_writer.latest_epoch_info.absolute_slot = clock.slot;
-                            svm_writer.latest_epoch_info.epoch = clock.epoch;
-                            svm_writer.latest_epoch_info.slot_index = clock.slot;
-                            svm_writer.latest_epoch_info.epoch = clock.epoch;
-                            svm_writer.latest_epoch_info.absolute_slot = clock.slot + clock.epoch * svm_writer.latest_epoch_info.slots_in_epoch;
+                            svm_writer.set_latest_absolute_slot(clock.slot);
                             svm_writer.simnet_events_tx.system_clock_updated(clock);
                         });
                     }
@@ -486,11 +482,7 @@ pub async fn start_block_production_runloop(
                         let epoch_info = svm_locker.with_svm_writer(|svm_writer| {
                             svm_writer.inner.set_sysvar(&clock);
                             svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
-                            svm_writer.latest_epoch_info.absolute_slot = clock.slot;
-                            svm_writer.latest_epoch_info.epoch = clock.epoch;
-                            svm_writer.latest_epoch_info.slot_index = clock.slot;
-                            svm_writer.latest_epoch_info.epoch = clock.epoch;
-                            svm_writer.latest_epoch_info.absolute_slot = clock.slot + clock.epoch * svm_writer.latest_epoch_info.slots_in_epoch;
+                            svm_writer.set_latest_absolute_slot(clock.slot);
                             svm_writer.simnet_events_tx.system_clock_updated(clock);
                             svm_writer.latest_epoch_info.clone()
                         });
