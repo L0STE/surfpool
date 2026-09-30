@@ -4,13 +4,12 @@ use std::{
     time::SystemTime,
 };
 
-use bincode::serialized_size;
 use crossbeam_channel::{Receiver, Sender};
 use itertools::Itertools;
 use litesvm::types::{
     FailedTransactionMetadata, SimulatedTransactionInfo, TransactionMetadata, TransactionResult,
 };
-use solana_account::{Account, ReadableAccount};
+use solana_account::{Account, ReadableAccount, state_traits::StateMut};
 use solana_account_decoder::{
     UiAccount, UiAccountEncoding, UiDataSliceConfig,
     parse_account_data::AccountAdditionalDataV3,
@@ -4474,10 +4473,6 @@ impl SurfnetSvmLocker {
             }
         };
 
-        let metadata_bytes = bincode::serialize(&new_metadata).map_err(|e| {
-            SurfpoolError::internal(format!("Failed to serialize program data metadata: {}", e))
-        })?;
-
         // Strip the minimum_program.so placeholder if it was pre-filled by
         // init_programdata_account during program account creation. This prevents
         // leftover placeholder bytes when the actual program is smaller than 3312 bytes.
@@ -4512,7 +4507,9 @@ impl SurfnetSvmLocker {
         }
 
         // Write the metadata
-        program_data_account.data[..metadata_size].copy_from_slice(&metadata_bytes);
+        program_data_account.set_state(&new_metadata).map_err(|e| {
+            SurfpoolError::internal(format!("Failed to serialize program data metadata: {}", e))
+        })?;
         // Write data at the specified offset
         program_data_account.data[absolute_offset..end_offset].copy_from_slice(&data);
 
@@ -4583,27 +4580,17 @@ fn update_programdata_account(
         slot,
     } = upgradeable_loader_state
     {
-        let offset = if upgrade_authority_address.is_some() {
-            UpgradeableLoaderState::size_of_programdata_metadata()
-        } else {
-            UpgradeableLoaderState::size_of_programdata_metadata()
-                - serialized_size(&Pubkey::default()).unwrap() as usize
-        };
-
-        let mut data = bincode::serialize(&UpgradeableLoaderState::ProgramData {
-            upgrade_authority_address: new_authority,
-            slot,
-        })
-        .map_err(|e| {
-            SurfpoolError::invalid_program_account(
-                program_id,
-                format!("Failed to serialize program data: {}", e),
-            )
-        })?;
-
-        data.append(&mut programdata_account.data[offset..].to_vec());
-
-        programdata_account.data = data;
+        programdata_account
+            .set_state(&UpgradeableLoaderState::ProgramData {
+                upgrade_authority_address: new_authority,
+                slot,
+            })
+            .map_err(|e| {
+                SurfpoolError::invalid_program_account(
+                    program_id,
+                    format!("Failed to serialize program data: {}", e),
+                )
+            })?;
 
         Ok(upgrade_authority_address)
     } else {
