@@ -3556,20 +3556,12 @@ impl SurfnetSvm {
         if let Some(subscriptions) = self.program_subscriptions.remove(&program_id) {
             for (encoding, filters, tx) in subscriptions {
                 // Apply filters if present
-                if let Some(ref active_filters) = filters {
-                    match super::locker::apply_rpc_filters(&account.data, active_filters) {
-                        Ok(true) => {} // Account matches all filters
-                        Ok(false) => {
-                            // Filtered out - keep subscription active but don't notify
-                            remaining.push((encoding, filters, tx));
-                            continue;
-                        }
-                        Err(_) => {
-                            // Error applying filter - keep subscription, skip notification
-                            remaining.push((encoding, filters, tx));
-                            continue;
-                        }
-                    }
+                if let Some(ref active_filters) = filters
+                    && !super::locker::apply_rpc_filters(&account.data, active_filters)
+                {
+                    // Filtered out - keep subscription active but don't notify
+                    remaining.push((encoding, filters, tx));
+                    continue;
                 }
 
                 let config = RpcAccountInfoConfig {

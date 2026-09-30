@@ -52,6 +52,7 @@ use solana_transaction_status::{
     TransactionTokenBalance, UiConfirmedBlock, UiTransactionEncoding,
     VersionedTransactionWithStatusMeta, extract_and_fmt_memos,
 };
+use spl_token_2022_interface::generic_token_account::GenericTokenAccount;
 use surfpool_types::{
     AccountSnapshot, ComputeUnitsEstimationResult, ExecutionCapture, ExportSnapshotConfig, Idl,
     KeyedProfileResult, ProfileResult, RpcProfileResultConfig, RunbookExecutionStatusReport,
@@ -1630,15 +1631,6 @@ impl SurfnetSvmLocker {
         pubkey: &Pubkey,
         config: Option<&RpcSignaturesForAddressConfig>,
     ) -> SurfpoolContextualizedResult<Vec<RpcConfirmedTransactionStatusWithSignature>> {
-        let limit = config
-            .and_then(|config| config.limit)
-            .unwrap_or(MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT);
-        if limit == 0 || limit > MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT {
-            return Err(SurfpoolError::invalid_params(format!(
-                "Invalid limit; max {MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT}"
-            )));
-        }
-
         let results = if let Some((remote_client, _)) = remote_ctx {
             self.get_signatures_for_address_local_then_remote(remote_client, pubkey, config)
                 .await?
@@ -3723,12 +3715,10 @@ impl SurfnetSvmLocker {
 
             let mut filtered = vec![];
             for (pubkey, account) in &res {
-                if let Some(ref active_filters) = filters {
-                    match apply_rpc_filters(&account.data, active_filters) {
-                        Ok(true) => {}           // Account matches all filters
-                        Ok(false) => continue,   // Filtered out
-                        Err(e) => return Err(e), // Error applying filter, already JsonRpcError
-                    }
+                if let Some(ref active_filters) = filters
+                    && !apply_rpc_filters(&account.data, active_filters)
+                {
+                    continue;
                 }
 
                 filtered.push(svm_reader.account_to_rpc_keyed_account(
@@ -3738,7 +3728,7 @@ impl SurfnetSvmLocker {
                     None,
                 ));
             }
-            Ok(filtered)
+            Ok::<_, SurfpoolError>(filtered)
         })?;
 
         Ok(self.with_contextualized_svm_reader(|_| res.clone()))
@@ -4531,31 +4521,15 @@ impl SurfnetSvmLocker {
 }
 
 // Helper function to apply filters
-pub(crate) fn apply_rpc_filters(
-    account_data: &[u8],
-    filters: &[RpcFilterType],
-) -> SurfpoolResult<bool> {
-    for filter in filters {
-        match filter {
-            RpcFilterType::DataSize(size) => {
-                if account_data.len() as u64 != *size {
-                    return Ok(false);
-                }
-            }
-            RpcFilterType::Memcmp(memcmp_filter) => {
-                // Use the public bytes_match method from solana_client::rpc_filter::Memcmp
-                if !memcmp_filter.bytes_match(account_data) {
-                    return Ok(false); // Content mismatch or out of bounds handled by bytes_match
-                }
-            }
-            RpcFilterType::TokenAccountState => {
-                return Err(SurfpoolError::internal(
-                    "TokenAccountState filter is not supported",
-                ));
-            }
+// Mirrors Agave's `rpc/src/filter.rs` `filter_allows`.
+pub(crate) fn apply_rpc_filters(account_data: &[u8], filters: &[RpcFilterType]) -> bool {
+    filters.iter().all(|filter| match filter {
+        RpcFilterType::DataSize(size) => account_data.len() as u64 == *size,
+        RpcFilterType::Memcmp(compare) => compare.bytes_match(account_data),
+        RpcFilterType::TokenAccountState => {
+            spl_token_2022_interface::state::Account::valid_account_data(account_data)
         }
-    }
-    Ok(true)
+    })
 }
 
 // used in the remote.rs
