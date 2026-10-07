@@ -93,7 +93,10 @@ use super::{
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
     rpc::utils::convert_transaction_metadata_from_canonical,
-    scenarios::{TemplateRegistry, account_data_values, template_registry},
+    scenarios::{
+        TemplateRegistry, account_data_values,
+        protocols::phoenix_eternal::v1::state_builder::prepare_phoenix_override, template_registry,
+    },
     storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
         LogsSubscriptionData, locker::is_supported_token_program, surfnet_lite_svm::SurfnetLiteSvm,
@@ -3038,7 +3041,9 @@ impl SurfnetSvm {
             );
 
             // Fetch fresh account data from remote if requested
-            if override_instance.fetch_before_use && !settled_this_slot.contains(&account_pubkey) {
+            let fetch_from_upstream =
+                override_instance.fetch_before_use && !settled_this_slot.contains(&account_pubkey);
+            if fetch_from_upstream {
                 if let Some((client, _)) = remote_ctx {
                     debug!(
                         "Fetching fresh account data for {} from remote",
@@ -3207,6 +3212,42 @@ impl SurfnetSvm {
                         ),
                     }
                     continue;
+                }
+
+                match prepare_phoenix_override(
+                    self,
+                    &account_pubkey,
+                    &account,
+                    &account_values,
+                    remote_ctx,
+                    // Only an account core has just refetched counts as fresh.
+                    fetch_from_upstream && settled_this_slot.contains(&account_pubkey),
+                )
+                .await
+                {
+                    Ok(Some(writes)) => {
+                        for (pubkey, written) in writes {
+                            if let Err(e) = self.set_account(&pubkey, written) {
+                                warn!(
+                                    "Failed to set {} for override {}: {}",
+                                    pubkey, override_instance.id, e
+                                );
+                                break;
+                            }
+                            settled_this_slot.insert(pubkey);
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            "Skipping override {} for {}: {}",
+                            override_instance.id, account_pubkey, e
+                        );
+                        // A bad value in one override is that override's failure, never the
+                        // batch's: an error returned from this loop aborts block production.
+                        continue;
+                    }
                 }
 
                 // Mints fail the token unpack and keep flowing through the IDL path.
@@ -3388,16 +3429,26 @@ impl SurfnetSvm {
                 ))
             })?;
 
-        // Find the corresponding type definition
+        let encoded =
+            Self::get_forged_idl_type_data(serialized_data, idl, &account_def.name, overrides)?;
+        let mut result = discriminator.to_vec();
+        result.extend_from_slice(&encoded);
+        Ok(result)
+    }
+
+    pub(crate) fn get_forged_idl_type_data(
+        serialized_data: &[u8],
+        idl: &Idl,
+        type_name: &str,
+        overrides: &HashMap<String, serde_json::Value>,
+    ) -> SurfpoolResult<Vec<u8>> {
+        // A type can also describe a record embedded in a dynamically addressed account.
         let account_type = idl
             .types
             .iter()
-            .find(|t| t.name == account_def.name)
+            .find(|t| t.name == type_name)
             .ok_or_else(|| {
-                SurfpoolError::internal(format!(
-                    "Type definition for account '{}' not found in IDL",
-                    account_def.name
-                ))
+                SurfpoolError::internal(format!("Type definition '{}' not found in IDL", type_name))
             })?;
 
         // Set up generics for parsing
@@ -3457,10 +3508,8 @@ impl SurfnetSvm {
                     ))
                 })?;
 
-        // Reconstruct the account data with discriminator and preserve any trailing bytes
-        let mut new_account_data =
-            Vec::with_capacity(8 + re_encoded_data.len() + leftover_bytes.len());
-        new_account_data.extend_from_slice(discriminator);
+        // Preserve trailing data outside the IDL type.
+        let mut new_account_data = Vec::with_capacity(re_encoded_data.len() + leftover_bytes.len());
         new_account_data.extend_from_slice(&re_encoded_data);
         new_account_data.extend_from_slice(leftover_bytes);
 
@@ -4642,7 +4691,9 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::{storage::tests::TestType, surfnet::locker::SurfnetSvmLocker};
+    use crate::{
+        storage::tests::TestType, surfnet::locker::SurfnetSvmLocker, tests::helpers::canned_rpc,
+    };
 
     #[test]
     fn startup_status_subscription_tracks_accepted_transitions() {
@@ -4793,35 +4844,6 @@ mod tests {
         assert_eq!(&patched[64..72], &42u64.to_le_bytes());
         assert_eq!(&patched[..64], &account.data[..64]);
         assert_eq!(&patched[72..], &account.data[72..]);
-    }
-
-    /// Minimal JSON-RPC stand-in that answers every request with one canned `result` body, so
-    /// the remote-fetch branches can be exercised without a network.
-    async fn canned_rpc(result_json: &'static str) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind canned rpc");
-        let addr = listener.local_addr().expect("local addr");
-
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = vec![0u8; 16 * 1024];
-                    let _ = stream.read(&mut buf).await;
-                    let body = format!(r#"{{"jsonrpc":"2.0","result":{result_json},"id":1}}"#);
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.flush().await;
-                });
-            }
-        });
-
-        format!("http://{addr}")
     }
 
     /// A 165-byte SPL token account of `mint` (state = Initialized), which sends `get_account`
