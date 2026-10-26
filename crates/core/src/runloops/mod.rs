@@ -196,6 +196,9 @@ pub async fn start_local_surfnet_runloop(
     };
 
     svm_locker.initialize(&remote_rpc_client).await?;
+    if let Some(genesis_hash) = simnet.genesis_hash {
+        svm_locker.with_svm_writer(|svm| svm.cached_genesis_hash = Some(genesis_hash));
+    }
 
     if let Some(remote_client) = &remote_rpc_client {
         svm_locker
