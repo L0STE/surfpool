@@ -1527,6 +1527,12 @@ impl GeyserAccountUpdate {
 pub enum TimeTravelConfig {
     AbsoluteEpoch(Epoch),
     AbsoluteSlot(Slot),
+    /// A slot reached at a given UNIX timestamp in milliseconds, rather than one
+    /// extrapolated from the slot time.
+    AbsoluteSlotAt {
+        slot: Slot,
+        timestamp: u64,
+    },
     AbsoluteTimestamp(u64),
 }
 

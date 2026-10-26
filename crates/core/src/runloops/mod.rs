@@ -486,12 +486,9 @@ pub async fn start_block_production_runloop(
                             ));
                         }
 
-                        svm_locker.with_svm_writer(|svm_writer| {
-                            svm_writer.inner.set_sysvar(&clock);
-                            svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
-                            svm_writer.set_latest_absolute_slot(clock.slot);
-                            svm_writer.simnet_events_tx.system_clock_updated(clock);
-                        });
+                        if let Err(e) = svm_locker.with_svm_writer(|svm_writer| svm_writer.apply_time_travel(clock)) {
+                            svm_locker.simnet_events_tx().error(format!("Failed to time travel: {e}"));
+                        }
                     }
                     SimnetCommand::UpdateInternalClockWithConfirmation(_, clock, response_tx) => {
                         // Confirm the current block to materialize any scheduled overrides for this slot
@@ -501,13 +498,9 @@ pub async fn start_block_production_runloop(
                             ));
                         }
 
-                        let epoch_info = svm_locker.with_svm_writer(|svm_writer| {
-                            svm_writer.inner.set_sysvar(&clock);
-                            svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
-                            svm_writer.set_latest_absolute_slot(clock.slot);
-                            svm_writer.simnet_events_tx.system_clock_updated(clock);
-                            svm_writer.latest_epoch_info.clone()
-                        });
+                        let epoch_info = svm_locker
+                            .with_svm_writer(|svm_writer| svm_writer.apply_time_travel(clock))
+                            .map_err(|e| e.to_string());
 
                         // Send confirmation back
                         let _ = response_tx.send(epoch_info);
