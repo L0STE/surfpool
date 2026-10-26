@@ -567,6 +567,8 @@ pub struct SurfnetSvm {
     pub instruction_profiling_enabled: bool,
     pub max_profiles: usize,
     pub skip_blockhash_check: bool,
+    /// The simnet's `skip_signature_verification`, which a send's `skip_sig_verify` overrides.
+    pub skip_signature_verification: bool,
     pub runbook_executions: Vec<RunbookExecutionStatusReport>,
     /// The startup state machine. Kept private so that every mutation goes
     /// through [`Self::seal_startup_plan`] and its sibling wrappers, which
@@ -901,6 +903,7 @@ impl SurfnetSvm {
             instruction_profiling_enabled: self.instruction_profiling_enabled,
             max_profiles: self.max_profiles,
             skip_blockhash_check: self.skip_blockhash_check,
+            skip_signature_verification: self.skip_signature_verification,
             runbook_executions: self.runbook_executions.clone(),
             startup_status: self.startup_status.clone(),
             // Same rule as the dummy event channels above: the sandbox gets a
@@ -1327,6 +1330,7 @@ impl SurfnetSvm {
             instruction_profiling_enabled: config.instruction_profiling_enabled,
             max_profiles: config.max_profiles,
             skip_blockhash_check: config.skip_blockhash_check,
+            skip_signature_verification: false,
             runbook_executions: Vec::new(),
             startup_status: SurfnetStartupStatus::default(),
             startup_status_watch_tx: tokio::sync::watch::channel(SurfnetStartupStatus::default()).0,
@@ -2233,8 +2237,6 @@ impl SurfnetSvm {
     /// requiring a mutable reference to the SVM, which we don't have/want in the simulation path.
     /// Additionally, having this function internally lets us do this check before we start fetching accounts from mainnet.
     pub fn sigverify(&self, tx: &VersionedTransaction) -> Result<(), FailedTransactionMetadata> {
-        let signature = tx.signatures[0];
-
         if tx.verify_with_results().iter().any(|valid| !*valid) {
             return Err(FailedTransactionMetadata {
                 err: TransactionError::SignatureFailure,
@@ -2242,16 +2244,26 @@ impl SurfnetSvm {
             });
         }
 
-        if matches!(
-            self.transactions.get(&signature.to_string()),
-            Ok(Some(SurfnetTransactionStatus::Processed(_)))
-        ) {
+        if self.processed_slot(tx).is_some() {
             return Err(FailedTransactionMetadata {
                 err: TransactionError::AlreadyProcessed,
                 meta: TransactionMetadata::default(),
             });
         }
         Ok(())
+    }
+
+    /// The slot that processed `tx`. Agave's status cache keys by message hash, so a stored
+    /// transaction under the same signature counts only if its message is the same.
+    pub(crate) fn processed_slot(&self, tx: &VersionedTransaction) -> Option<Slot> {
+        match self.transactions.get(&tx.signatures[0].to_string()) {
+            Ok(Some(SurfnetTransactionStatus::Processed(processed)))
+                if processed.0.transaction.message.hash() == tx.message.hash() =>
+            {
+                Some(processed.0.slot)
+            }
+            _ => None,
+        }
     }
 
     /// Sets an account in the local SVM state and notifies listeners.
