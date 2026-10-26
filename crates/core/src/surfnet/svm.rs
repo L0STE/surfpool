@@ -92,6 +92,7 @@ use super::{
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
+    helpers::time_travel::clock_for_slot,
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::{
         TemplateRegistry, account_data_values,
@@ -1695,12 +1696,18 @@ impl SurfnetSvm {
 
         // 3. Reconstruct Clock using absolute slot
         let unix_timestamp = self.calculate_block_time_for_slot(current_absolute_slot) / 1_000;
+        // Nothing restores when this epoch started on this chain, so it starts now, as a warp
+        // starts it at the Clock's time (`Bank::warp_from_parent`). After a restart the rebuilt
+        // Clock can run ahead of `updated_at`, the time the next blocks write, so take the
+        // earlier of the two: the epoch never starts after a time a program reads.
         let clock = Clock {
-            slot: current_absolute_slot,
-            epoch: self.latest_epoch_info.epoch,
-            unix_timestamp: unix_timestamp as i64,
-            epoch_start_timestamp: 0,
-            leader_schedule_epoch: 0,
+            epoch_start_timestamp: (unix_timestamp as i64).min((self.updated_at / 1_000) as i64),
+            ..clock_for_slot(
+                current_absolute_slot,
+                unix_timestamp as i64,
+                None,
+                &self.inner.get_sysvar::<EpochSchedule>(),
+            )
         };
         self.inner.set_sysvar(&clock);
     }
@@ -2964,13 +2971,23 @@ impl SurfnetSvm {
             .send(GeyserEvent::NotifyEntry(entry_info))
             .ok();
 
-        let clock: Clock = Clock {
-            slot: self.latest_epoch_info.absolute_slot,
-            epoch: self.latest_epoch_info.epoch,
-            unix_timestamp: self.updated_at as i64 / 1_000,
-            epoch_start_timestamp: 0, // todo
-            leader_schedule_epoch: 0, // todo
-        };
+        let epoch_schedule = self.inner.get_sysvar::<EpochSchedule>();
+        let mut closed = self.inner.get_sysvar::<Clock>();
+        // Under Alpenglow the footer of an epoch's first block starts the epoch at the time the
+        // block ended, the time the next slot opens at (`Bank::update_clock_from_footer`).
+        if self
+            .feature_set
+            .is_active(&agave_feature_set::alpenglow::id())
+            && epoch_schedule.get_epoch(slot.saturating_sub(1)) != closed.epoch
+        {
+            closed.epoch_start_timestamp = self.updated_at as i64 / 1_000;
+        }
+        let clock = clock_for_slot(
+            self.latest_epoch_info.absolute_slot,
+            self.updated_at as i64 / 1_000,
+            Some(&closed),
+            &epoch_schedule,
+        );
 
         let _ = self.simnet_events_tx.system_clock_updated(clock.clone());
         self.inner.set_sysvar(&clock);
@@ -6987,27 +7004,34 @@ mod tests {
     fn test_reconstruct_sysvars_clock(test_type: TestType) {
         let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
 
-        // Set up: chain_tip.index = 50, genesis_slot = 1000 (absolute slot = 1050)
+        // Set up: chain_tip.index = 50, genesis_slot = 2_161_000 (absolute slot 2_161_050, epoch 5)
         svm.chain_tip = BlockIdentifier::new(50, "test_hash");
-        svm.genesis_slot = 1000;
-        svm.latest_epoch_info.absolute_slot = 1050;
-        svm.latest_epoch_info.epoch = 5;
+        svm.genesis_slot = 2_161_000;
+        svm.latest_epoch_info.absolute_slot = 2_161_050;
         svm.genesis_updated_at = 2_000_000; // 2 seconds in ms
         svm.slot_time = 400; // 400ms per slot
+        // As after a restart, block production resumes earlier than the rebuilt Clock.
+        svm.updated_at = 2_010_000;
 
         svm.reconstruct_sysvars();
 
         // Verify Clock sysvar
         let clock = svm.inner.get_sysvar::<Clock>();
 
-        assert_eq!(clock.slot, 1050, "Clock slot should be absolute slot");
-        assert_eq!(clock.epoch, 5, "Clock epoch should match latest_epoch_info");
+        assert_eq!(clock.slot, 2_161_050, "Clock slot should be absolute slot");
+        assert_eq!(
+            clock.epoch, 5,
+            "Clock epoch should come from the epoch schedule"
+        );
 
         // Expected timestamp: genesis_updated_at + (50 slots * 400ms) = 2_000_000 + 20_000 = 2_020_000ms = 2020 seconds
         assert_eq!(
             clock.unix_timestamp, 2020,
             "Clock unix_timestamp should be calculated correctly"
         );
+        // The epoch starts no later than the time the next blocks write.
+        assert_eq!(clock.epoch_start_timestamp, 2010);
+        assert_eq!(clock.leader_schedule_epoch, 6);
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
@@ -8321,6 +8345,54 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected, "warmup: {}", schedule.warmup);
         }
+    }
+
+    /// Block after block, the Clock carries the epoch's start time over and resets it at the first
+    /// block of the next epoch, with the leader schedule epoch the schedule gives the slot, as
+    /// Agave's `Bank::update_clock` writes it.
+    /// Under Alpenglow, the footer of the epoch's first block moves the epoch's start to the time
+    /// that block ended (`Bank::update_clock_from_footer`).
+    #[test_case(false; "towerbft")]
+    #[test_case(true; "alpenglow")]
+    fn clock_epoch_fields_follow_agave_across_an_epoch_boundary(alpenglow: bool) {
+        let features = match alpenglow {
+            true => SvmFeatureConfig::new().enable(agave_feature_set::alpenglow::id()),
+            false => SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        };
+        let (mut svm, _events_rx, _geyser_rx) =
+            TestType::no_db().initialize_svm_with_features(features);
+        svm.slot_time = 1_000;
+        svm.updated_at = 1_000_000;
+        svm.latest_epoch_info.absolute_slot = 431_998;
+        svm.inner.set_sysvar(&Clock {
+            slot: 431_998,
+            epoch_start_timestamp: 7,
+            epoch: 0,
+            leader_schedule_epoch: 1,
+            unix_timestamp: 1_000,
+        });
+
+        let mut seen = vec![];
+        for _ in 0..3 {
+            svm.confirm_current_block().unwrap();
+            let clock = svm.inner.get_sysvar::<Clock>();
+            seen.push((
+                clock.slot,
+                clock.unix_timestamp,
+                clock.epoch,
+                clock.epoch_start_timestamp,
+                clock.leader_schedule_epoch,
+            ));
+        }
+
+        assert_eq!(
+            seen,
+            [
+                (431_999, 1_001, 0, 7, 1),
+                (432_000, 1_002, 1, 1_002, 2),
+                (432_001, 1_003, 1, if alpenglow { 1_003 } else { 1_002 }, 2),
+            ]
+        );
     }
 
     /// Garbage collection rebuilds LiteSVM, and must keep the epoch schedule the surfnet was
