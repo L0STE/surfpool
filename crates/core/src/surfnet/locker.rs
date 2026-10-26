@@ -2328,10 +2328,8 @@ impl SurfnetSvmLocker {
                     .get(&a.mint().to_string())
                     .ok()
                     .flatten()
-                    .ok_or(SurfpoolError::token_mint_not_found(a.mint()))
             })
-            .collect::<Result<Vec<_>, SurfpoolError>>()
-            .unwrap_or_default();
+            .collect();
 
         if do_propagate {
             let meta_canonical = convert_transaction_metadata_from_canonical(&meta);
@@ -2423,6 +2421,18 @@ impl SurfnetSvmLocker {
         let cus = transaction_metadata.compute_units_consumed;
         let logs = transaction_metadata.logs.clone();
         let signature = transaction.signatures[0];
+        // Read before the registries take the transaction's writes, as Agave reads each pre token
+        // balance's mint from the state before execution.
+        let pre_token_mints = token_accounts_before
+            .iter()
+            .map(|(_, a)| {
+                svm_writer
+                    .token_mints
+                    .get(&a.mint().to_string())
+                    .ok()
+                    .flatten()
+            })
+            .collect();
 
         let post_execution_capture = {
             let accounts_after = pubkeys_from_message
@@ -2519,7 +2529,7 @@ impl SurfnetSvmLocker {
                 }
             }
 
-            let token_mints = token_accounts_after
+            let post_token_mints = token_accounts_after
                 .iter()
                 .map(|(_, a)| {
                     svm_writer
@@ -2544,7 +2554,8 @@ impl SurfnetSvmLocker {
                     &accounts_after,
                     token_accounts_before,
                     &token_accounts_after,
-                    token_mints,
+                    pre_token_mints,
+                    post_token_mints,
                     token_programs,
                     &post_token_program_ids,
                     loaded_addresses.clone().unwrap_or_default(),
@@ -7274,8 +7285,8 @@ mod tests {
         assert_eq!(result.inner, expected_hash);
     }
 
-    /// A token account the transaction closes is not in its post token balances: a validator
-    /// reads them from the accounts after execution, where a closed account no longer exists.
+    /// A token account the transaction closes is in its pre token balances only: a validator
+    /// reads the post ones from the accounts after execution, where it no longer exists.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_closed_token_account_has_no_post_token_balance() {
         use crossbeam_channel::unbounded;
@@ -7286,6 +7297,13 @@ mod tests {
         let locker = SurfnetSvmLocker::new(svm);
         let owner = Keypair::new();
         let (mint, token_account) = (Pubkey::new_unique(), Pubkey::new_unique());
+        // `missing_mint` is never created, so its token account's mint cannot be loaded.
+        let (missing_mint, source, destination, closed_later) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
         let _ = locker
             .airdrop(&owner.pubkey(), 1_000_000_000)
             .expect("airdrop should succeed");
@@ -7307,56 +7325,140 @@ mod tests {
             let mut mint_data = vec![0; Mint::LEN];
             Mint {
                 is_initialized: true,
+                decimals: 6,
                 ..Default::default()
             }
             .pack_into_slice(&mut mint_data);
             account(&mint, mint_data);
-            let mut token_data = vec![0; TokenAccount::LEN];
-            TokenAccount {
-                mint,
-                owner: owner.pubkey(),
-                state: AccountState::Initialized,
-                ..Default::default()
+            for (pubkey, mint) in [
+                (&token_account, mint),
+                (&source, mint),
+                (&destination, missing_mint),
+                (&closed_later, mint),
+            ] {
+                let mut token_data = vec![0; TokenAccount::LEN];
+                TokenAccount {
+                    mint,
+                    owner: owner.pubkey(),
+                    state: AccountState::Initialized,
+                    ..Default::default()
+                }
+                .pack_into_slice(&mut token_data);
+                account(pubkey, token_data);
             }
-            .pack_into_slice(&mut token_data);
-            account(&token_account, token_data);
         });
+        let process = async |instruction| {
+            let message = Message::new_with_blockhash(
+                &[instruction],
+                Some(&owner.pubkey()),
+                &locker.latest_absolute_blockhash(),
+            );
+            let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&owner])
+                .expect("transaction should sign");
+            let signature = tx.signatures[0];
+            let (status_tx, _status_rx) = unbounded();
+            locker
+                .process_transaction(&None, tx, status_tx, true, true)
+                .await
+                .expect("transaction processing should succeed");
+            locker.with_svm_reader(|svm| {
+                let (transaction, _) = svm
+                    .transactions
+                    .get(&signature.to_string())
+                    .unwrap()
+                    .expect("the transaction status should be stored")
+                    .expect_processed()
+                    .clone();
+                transaction.meta
+            })
+        };
+        let decimals = |balances: Option<Vec<TransactionTokenBalance>>| {
+            balances.map(|balances| {
+                balances
+                    .iter()
+                    .map(|balance| balance.ui_token_amount.decimals)
+                    .collect::<Vec<_>>()
+            })
+        };
 
-        let close = spl_token_interface::instruction::close_account(
+        let close = |token_account| {
+            spl_token_interface::instruction::close_account(
+                &spl_token_interface::ID,
+                &token_account,
+                &owner.pubkey(),
+                &owner.pubkey(),
+                &[],
+            )
+            .unwrap()
+        };
+
+        let meta = process(close(token_account)).await;
+        assert_eq!(
+            (
+                meta.status,
+                decimals(meta.pre_token_balances),
+                meta.post_token_balances
+            ),
+            (Ok(()), Some(vec![6]), Some(vec![]))
+        );
+
+        // A failed transaction keeps the balances of the token accounts whose mint loads.
+        let transfer = spl_token_interface::instruction::transfer(
             &spl_token_interface::ID,
-            &token_account,
-            &owner.pubkey(),
+            &source,
+            &destination,
             &owner.pubkey(),
             &[],
+            1,
         )
         .unwrap();
-        let message = Message::new_with_blockhash(
-            &[close],
-            Some(&owner.pubkey()),
-            &locker.latest_absolute_blockhash(),
-        );
-        let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&owner])
-            .expect("transaction should sign");
-        let signature = tx.signatures[0];
-        let (status_tx, _status_rx) = unbounded();
-        locker
-            .process_transaction(&None, tx, status_tx, true, true)
-            .await
-            .expect("transaction processing should succeed");
-
-        let meta = locker.with_svm_reader(|svm| {
-            let (transaction, _) = svm
-                .transactions
-                .get(&signature.to_string())
-                .unwrap()
-                .unwrap()
-                .expect_processed()
-                .clone();
-            transaction.meta
-        });
+        let meta = process(transfer).await;
         assert_eq!(
-            (meta.status, meta.post_token_balances),
+            (meta.status.is_err(), decimals(meta.pre_token_balances)),
+            (true, Some(vec![6]))
+        );
+
+        // A mint that fails to load leaves its entry out instead of losing the status.
+        locker.with_svm_writer(|svm| svm.token_mints = Box::new(FailingMints));
+        let meta = process(close(closed_later)).await;
+        assert_eq!(
+            (meta.status, meta.pre_token_balances),
             (Ok(()), Some(vec![]))
         );
+    }
+
+    use crate::{
+        storage::{Storage, StorageError, StorageResult},
+        types::MintAccount,
+    };
+
+    #[derive(Clone)]
+    struct FailingMints;
+
+    impl Storage<String, MintAccount> for FailingMints {
+        fn store(&mut self, _: String, _: MintAccount) -> StorageResult<()> {
+            Ok(())
+        }
+        fn clear(&mut self) -> StorageResult<()> {
+            Ok(())
+        }
+        fn get(&self, _: &String) -> StorageResult<Option<MintAccount>> {
+            Err(StorageError::LockError)
+        }
+        fn take(&mut self, _: &String) -> StorageResult<Option<MintAccount>> {
+            Err(StorageError::LockError)
+        }
+        fn keys(&self) -> StorageResult<Vec<String>> {
+            Err(StorageError::LockError)
+        }
+        fn into_iter(&self) -> StorageResult<Box<dyn Iterator<Item = (String, MintAccount)> + '_>> {
+            Err(StorageError::LockError)
+        }
+        fn count(&self) -> StorageResult<u64> {
+            Err(StorageError::LockError)
+        }
+        fn clone_box(&self) -> Box<dyn Storage<String, MintAccount>> {
+            Box::new(self.clone())
+        }
     }
 }
