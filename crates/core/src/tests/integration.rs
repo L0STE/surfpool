@@ -6703,6 +6703,12 @@ async fn test_get_signatures_for_address_local_then_remote(test_type: TestType) 
         "local airdrops must produce distinct signatures"
     );
     // local_sigs[0] is the newer local signature; local_sigs[1] is the older one.
+    // The default `finalized` commitment lists only finalized signatures. The datasource
+    // signatures are older, so they are finalized by then too.
+    local_rpc
+        .poll_for_signature_with_commitment(&local_sigs[0], CommitmentConfig::finalized())
+        .await
+        .expect("local airdrop should finalize");
 
     // Scenario A: `before` is a local-only signature.
     // Pre-fix surfpool forwarded `before=local_sigs[0]` to the datasource, which had never seen
@@ -7371,7 +7377,9 @@ async fn test_remote_get_multiple_accounts_ordering(test_type: TestType) {
 #[test_case(TestType::in_memory(), false; "legacy with sqlite")]
 #[tokio::test(flavor = "multi_thread")]
 async fn finalization_follows_the_alpenglow_feature(test_type: TestType, alpenglow: bool) {
-    use solana_client::rpc_config::{RpcTransactionConfig, RpcTransactionLogsFilter};
+    use solana_client::rpc_config::{
+        RpcSignaturesForAddressConfig, RpcTransactionConfig, RpcTransactionLogsFilter,
+    };
     use solana_transaction_status::TransactionConfirmationStatus;
 
     use crate::{
@@ -7446,8 +7454,41 @@ async fn finalization_follows_the_alpenglow_feature(test_type: TestType, alpengl
         assert_eq!(status.slot, transaction_slot);
         assert_eq!(status.confirmation_status, expected);
         assert_eq!(status.confirmations, confirmations);
-        let signatures = locker.get_signatures_for_address_local(&payer.pubkey(), None);
-        assert_eq!(signatures.inner()[0].confirmation_status, expected);
+        // At the default `finalized` commitment, the signature is listed once finalized.
+        let signatures = locker
+            .get_signatures_for_address_local(&payer.pubkey(), None)
+            .unwrap();
+        assert_eq!(
+            signatures
+                .inner()
+                .first()
+                .and_then(|s| s.confirmation_status.clone()),
+            expected
+                .clone()
+                .filter(|s| *s == TransactionConfirmationStatus::Finalized)
+        );
+        // Until then, Agave cannot find it as a boundary at that commitment.
+        let until = RpcSignaturesForAddressConfig {
+            until: Some(signature.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            locker
+                .get_signatures_for_address_local(&payer.pubkey(), Some(&until))
+                .map(|_| ())
+                .map_err(|e| {
+                    let e = jsonrpc_core::Error::from(e);
+                    (e.code, e.message)
+                }),
+            if expected == Some(TransactionConfirmationStatus::Finalized) {
+                Ok(())
+            } else {
+                Err((
+                    jsonrpc_core::ErrorCode::ServerError(-32020),
+                    format!("Transaction {signature} not found"),
+                ))
+            }
+        );
         let transactions = locker
             .get_transactions_for_address_local(
                 &payer.pubkey(),

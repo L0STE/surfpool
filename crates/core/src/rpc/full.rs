@@ -1075,7 +1075,7 @@ pub trait Full {
     ///   - `before`: Start search before this signature.
     ///   - `until`: Search until this signature (exclusive).
     ///   - `limit`: Maximum number of results to return (default: 1,000; max: 1,000).
-    ///   - `commitment`: The level of commitment desired (e.g., finalized).
+    ///   - `commitment`: `confirmed` or `finalized` (default); `processed` is rejected.
     ///   - `minContextSlot`: The minimum slot that the query should be evaluated at.
     ///
     /// ## Returns
@@ -1085,7 +1085,7 @@ pub trait Full {
     /// - `err`: If the transaction failed, an error object; otherwise `null`.
     /// - `memo`: Optional memo attached to the transaction.
     /// - `blockTime`: Approximate production time of the block containing the transaction (Unix timestamp).
-    /// - `confirmationStatus`: One of `processed`, `confirmed`, or `finalized`.
+    /// - `confirmationStatus`: `confirmed` or `finalized`.
     ///
     /// ## Example Request
     /// ```json
@@ -2413,8 +2413,14 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
+            let commitment = config.as_ref().and_then(|config| config.commitment);
+            if !commitment.unwrap_or_default().is_at_least_confirmed() {
+                return Err(Error::invalid_params(
+                    "Method does not support commitment below `confirmed`",
+                ));
+            }
             svm_locker.read_slot(
-                config.as_ref().and_then(|config| config.commitment),
+                commitment,
                 config.as_ref().and_then(|config| config.min_context_slot),
             )?;
             let signatures = svm_locker

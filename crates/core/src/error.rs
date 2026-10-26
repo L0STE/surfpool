@@ -492,6 +492,15 @@ impl SurfpoolError {
         Self(error)
     }
 
+    pub fn filter_transaction_not_found(signature: &str) -> Self {
+        Self(
+            RpcCustomError::FilterTransactionNotFound {
+                signature: signature.to_string(),
+            }
+            .into(),
+        )
+    }
+
     pub fn tag_not_found(tag: &str) -> Self {
         let mut error = Error::internal_error();
         error.message = format!("Profile result associated with tag '{tag}' not found in the SVM");

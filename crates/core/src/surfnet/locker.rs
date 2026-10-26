@@ -83,7 +83,6 @@ use crate::{
         },
         utils::{convert_transaction_metadata_from_canonical, verify_pubkey},
     },
-    storage::StorageResult,
     types::{
         GeyserAccountUpdate, OfflineAccountConfig, RemoteRpcResult, SurfnetTransactionStatus,
         TimeTravelConfig, TokenAccount, TransactionLoadedAddresses, TransactionWithStatusMeta,
@@ -1436,12 +1435,52 @@ impl SurfnetSvmLocker {
         &self,
         pubkey: &Pubkey,
         config: Option<&RpcSignaturesForAddressConfig>,
-    ) -> SvmAccessContext<Vec<RpcConfirmedTransactionStatusWithSignature>> {
+    ) -> SurfpoolContextualizedResult<Vec<RpcConfirmedTransactionStatusWithSignature>> {
+        self.get_signatures_for_address_local_with_boundaries(pubkey, config)
+            .map(|results| {
+                let (signatures, _, _) = results.inner;
+                SvmAccessContext::new(
+                    results.slot,
+                    results.latest_epoch_info,
+                    results.latest_blockhash,
+                    signatures,
+                )
+            })
+    }
+
+    /// The local signatures, and whether `before` and `until` are local signatures.
+    #[allow(clippy::type_complexity)]
+    fn get_signatures_for_address_local_with_boundaries(
+        &self,
+        pubkey: &Pubkey,
+        config: Option<&RpcSignaturesForAddressConfig>,
+    ) -> SurfpoolContextualizedResult<(Vec<RpcConfirmedTransactionStatusWithSignature>, bool, bool)>
+    {
         let before = config.and_then(|c| c.before.as_ref());
         let until = config.and_then(|c| c.until.as_ref());
         let limit = config.and_then(|c| c.limit).unwrap_or(1000);
+        let commitment = config.and_then(|c| c.commitment).unwrap_or_default();
 
-        self.with_contextualized_svm_reader(move |svm_reader| {
+        let results = self.with_contextualized_svm_reader(move |svm_reader| {
+            // As in Agave, only slots visible at the commitment are listed.
+            let highest_slot = svm_reader.slot_for_commitment(&commitment);
+
+            // Agave's blockstore does not find a boundary above that slot, and the datasource
+            // never has a local signature, so Agave rejects it as FilterTransactionNotFound.
+            let is_local = |sig: Option<&String>| -> SurfpoolResult<bool> {
+                let Some(sig) = sig else {
+                    return Ok(false);
+                };
+                match svm_reader.transactions.get(sig)? {
+                    Some(status) if status.expect_processed().0.slot > highest_slot => {
+                        Err(SurfpoolError::filter_transaction_not_found(sig))
+                    }
+                    status => Ok(status.is_some()),
+                }
+            };
+            let before_is_local = is_local(before)?;
+            let until_is_local = is_local(until)?;
+
             let sigs: Vec<_> = svm_reader
                 .transactions
                 .into_iter()
@@ -1459,11 +1498,13 @@ impl SurfnetSvmLocker {
                             return None;
                         };
 
-                        if !transaction_involves_address(
-                            &transaction,
-                            &meta.loaded_addresses,
-                            pubkey,
-                        ) {
+                        if slot > highest_slot
+                            || !transaction_involves_address(
+                                &transaction,
+                                &meta.loaded_addresses,
+                                pubkey,
+                            )
+                        {
                             return None;
                         }
 
@@ -1550,8 +1591,19 @@ impl SurfnetSvmLocker {
             };
 
             // Apply the pagination window first, then enforce the RPC limit on that slice.
-            sigs[window].iter().take(limit).cloned().collect()
-        })
+            Ok::<_, SurfpoolError>((
+                sigs[window].iter().take(limit).cloned().collect(),
+                before_is_local,
+                until_is_local,
+            ))
+        });
+        let inner = results.inner?;
+        Ok(SvmAccessContext::new(
+            results.slot,
+            results.latest_epoch_info,
+            results.latest_blockhash,
+            inner,
+        ))
     }
 
     pub async fn get_signatures_for_address_local_then_remote(
@@ -1560,7 +1612,7 @@ impl SurfnetSvmLocker {
         pubkey: &Pubkey,
         config: Option<&RpcSignaturesForAddressConfig>,
     ) -> SurfpoolContextualizedResult<Vec<RpcConfirmedTransactionStatusWithSignature>> {
-        let results = self.get_signatures_for_address_local(pubkey, config);
+        let results = self.get_signatures_for_address_local_with_boundaries(pubkey, config)?;
         let limit = config.and_then(|c| c.limit).unwrap_or(1000);
         let first_local_slot = self.with_svm_reader(|svm| svm.genesis_slot);
 
@@ -1568,25 +1620,9 @@ impl SurfnetSvmLocker {
             slot,
             latest_blockhash,
             latest_epoch_info,
-            inner: mut combined_results,
+            inner: (mut combined_results, before_is_local, until_is_local),
         } = results;
         if combined_results.len() < limit {
-            let (before_is_local, until_is_local) =
-                self.with_svm_reader(|svm_reader| -> StorageResult<(bool, bool)> {
-                    let is_local = |sig: &String| -> StorageResult<bool> {
-                        Ok(svm_reader.transactions.get(sig)?.is_some())
-                    };
-                    let before_local = match config.and_then(|c| c.before.as_ref()) {
-                        Some(sig) => is_local(sig)?,
-                        None => false,
-                    };
-                    let until_local = match config.and_then(|c| c.until.as_ref()) {
-                        Some(sig) => is_local(sig)?,
-                        None => false,
-                    };
-                    Ok((before_local, until_local))
-                })?;
-
             let remaining_limit = limit - combined_results.len();
             if let Some(remote_config) = signatures_for_address_remote_config(
                 config,
@@ -1623,7 +1659,7 @@ impl SurfnetSvmLocker {
             self.get_signatures_for_address_local_then_remote(remote_client, pubkey, config)
                 .await?
         } else {
-            self.get_signatures_for_address_local(pubkey, config)
+            self.get_signatures_for_address_local(pubkey, config)?
         };
 
         Ok(results)
@@ -5868,8 +5904,12 @@ mod tests {
         )
         .await;
 
-        let SvmAccessContext { inner: sigs, .. } =
-            locker.get_signatures_for_address_local(&payer_pubkey, None);
+        for _ in 0..locker.with_svm_reader(|svm| svm.finalization_slot_threshold()) {
+            locker.confirm_current_block(&None).await.unwrap();
+        }
+        let SvmAccessContext { inner: sigs, .. } = locker
+            .get_signatures_for_address_local(&payer_pubkey, None)
+            .unwrap();
 
         let row_with_memo = sigs
             .iter()
@@ -6316,6 +6356,11 @@ mod tests {
                 ),
             )
             .unwrap();
+        // Finalize the slot, so that the default commitment lists it.
+        svm.latest_epoch_info.absolute_slot = svm
+            .latest_epoch_info
+            .absolute_slot
+            .max(slot + svm.finalization_slot_threshold());
     }
 
     fn seed_signature_history(
@@ -6353,6 +6398,7 @@ mod tests {
     ) -> Vec<String> {
         locker
             .get_signatures_for_address_local(pubkey, config)
+            .unwrap()
             .inner
             .iter()
             .map(|s| s.signature.clone())
@@ -6634,7 +6680,9 @@ mod tests {
             // No block header stored — should not panic
         });
 
-        let result = locker.get_signatures_for_address_local(&pubkey, None);
+        let result = locker
+            .get_signatures_for_address_local(&pubkey, None)
+            .unwrap();
 
         // Both transactions should be returned regardless
         assert_eq!(result.inner.len(), 2);
