@@ -67,7 +67,9 @@ use uuid::Uuid;
 use super::{
     AccountFactory, AccountSource, CoupledAccount, GetAccountResult, GetTransactionResult,
     GeyserEvent, GeyserTransactionEvent, LocalSignatureStatusOrSubscription,
-    SignatureSubscriptionType, SurfnetSvm, remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
+    SignatureSubscriptionType, SurfnetSvm,
+    remote::SurfnetRemoteClient,
+    svm::{AccountUpdatePolicy, ReadSlot},
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
@@ -3975,6 +3977,17 @@ impl SurfnetSvmLocker {
 
     pub fn get_slot_for_commitment(&self, commitment: &CommitmentConfig) -> Slot {
         self.with_svm_reader(|svm_reader| svm_reader.slot_for_commitment(commitment))
+    }
+
+    /// Resolves `commitment` to a slot and refuses a `min_context_slot` above it.
+    /// Internally, this function calls [`SurfnetSvm::read_slot`] under a read guard. This
+    /// should be called before subsequent locker reads, so the context slot is valid for those reads.
+    pub fn read_slot(
+        &self,
+        commitment: Option<CommitmentConfig>,
+        min_context_slot: Option<Slot>,
+    ) -> jsonrpc_core::Result<ReadSlot> {
+        self.with_svm_reader(|svm| svm.read_slot(commitment, min_context_slot))
     }
 
     /// Executes an airdrop via the underlying SVM.

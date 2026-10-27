@@ -20,6 +20,7 @@ use solana_client::{
         RpcResponseContext, RpcSignatureResult,
     },
 };
+use solana_clock::Slot;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{Response as RpcResponse, SlotInfo, SlotUpdate};
@@ -33,6 +34,15 @@ use crate::{
         GetTransactionResult, LocalSignatureStatusOrSubscription, SignatureSubscriptionType,
     },
 };
+
+/// A notification for an update produced at `slot`.
+#[allow(clippy::disallowed_methods)] // notifications carry the slot of their event, not a read
+fn notification<T>(slot: Slot, value: T) -> RpcResponse<T> {
+    RpcResponse {
+        context: RpcResponseContext::new(slot),
+        value,
+    }
+}
 
 /// Configuration for account subscription requests.
 ///
@@ -1123,18 +1133,16 @@ impl SurfpoolWsRpc {
         };
 
         let result = match (subscription_type, is_received_event) {
-            (SignatureSubscriptionType::Received, true) => sink.notify(Ok(RpcResponse {
-                context: RpcResponseContext::new(slot),
-                value: RpcSignatureResult::ReceivedSignature(
-                    ReceivedSignatureResult::ReceivedSignature,
-                ),
-            })),
-            _ => sink.notify(Ok(RpcResponse {
-                context: RpcResponseContext::new(slot),
-                value: RpcSignatureResult::ProcessedSignature(ProcessedSignatureResult {
+            (SignatureSubscriptionType::Received, true) => sink.notify(Ok(notification(
+                slot,
+                RpcSignatureResult::ReceivedSignature(ReceivedSignatureResult::ReceivedSignature),
+            ))),
+            _ => sink.notify(Ok(notification(
+                slot,
+                RpcSignatureResult::ProcessedSignature(ProcessedSignatureResult {
                     err: err.map(Into::into),
                 }),
-            })),
+            ))),
         };
 
         if let Err(error) = result {
@@ -1503,10 +1511,7 @@ impl Rpc for SurfpoolWsRpc {
                     break;
                 };
 
-                if let Err(e) = sink.notify(Ok(RpcResponse {
-                    context: RpcResponseContext::new(slot),
-                    value: ui_account,
-                })) {
+                if let Err(e) = sink.notify(Ok(notification(slot, ui_account))) {
                     log::error!("Failed to notify client about account update: {e}");
                     break;
                 }
@@ -1718,10 +1723,7 @@ impl Rpc for SurfpoolWsRpc {
                     break;
                 };
 
-                if let Err(e) = sink.notify(Ok(RpcResponse {
-                    context: RpcResponseContext::new(slot),
-                    value,
-                })) {
+                if let Err(e) = sink.notify(Ok(notification(slot, value))) {
                     log::error!("Failed to notify client about logs update: {e}");
                     break;
                 }
@@ -1889,10 +1891,7 @@ impl Rpc for SurfpoolWsRpc {
                     break;
                 };
 
-                if let Err(e) = sink.notify(Ok(RpcResponse {
-                    context: RpcResponseContext::new(slot),
-                    value: keyed_account,
-                })) {
+                if let Err(e) = sink.notify(Ok(notification(slot, keyed_account))) {
                     log::error!("Failed to notify client about program account update: {e}");
                     break;
                 }

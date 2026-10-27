@@ -26,8 +26,12 @@ use solana_account_decoder::{
 use solana_client::{
     rpc_client::SerializableTransaction,
     rpc_config::{RpcAccountInfoConfig, RpcBlockConfig, RpcTransactionLogsFilter},
+    rpc_custom_error::RpcCustomError,
     rpc_filter::RpcFilterType,
-    rpc_response::{RpcKeyedAccount, RpcLogsResponse, RpcPerfSample},
+    rpc_response::{
+        Response as RpcResponse, RpcKeyedAccount, RpcLogsResponse, RpcPerfSample,
+        RpcResponseContext,
+    },
 };
 use solana_clock::{Clock, Slot};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
@@ -400,6 +404,43 @@ fn json_to_txtx_value(json: &serde_json::Value) -> SurfpoolResult<Value> {
 }
 
 pub type AccountOwner = Pubkey;
+
+/// The slot a read at some commitment answers for, with its `minContextSlot` already judged.
+/// Only [`SurfnetSvm::read_slot`] makes one.
+#[derive(Clone, Copy, Debug)]
+pub struct ReadSlot(Slot);
+
+impl ReadSlot {
+    pub fn slot(self) -> Slot {
+        self.0
+    }
+
+    /// Like Agave's `new_response(&bank, value)`: the response context is the slot read at.
+    #[allow(clippy::disallowed_methods)] // the one sanctioned context for request/response handlers
+    pub fn respond<T>(self, value: T) -> RpcResponse<T> {
+        RpcResponse {
+            context: RpcResponseContext::new(self.0),
+            value,
+        }
+    }
+
+    /// Like Agave's `bank.get_epoch_info()` on the bank at this slot.
+    pub fn epoch_info(self, svm: &SurfnetSvm) -> EpochInfo {
+        let tip = &svm.latest_epoch_info;
+        let schedule = svm.inner.get_sysvar::<EpochSchedule>();
+        let (epoch, slot_index) = schedule.get_epoch_and_slot_index(self.0);
+        EpochInfo {
+            epoch,
+            slot_index,
+            slots_in_epoch: schedule.get_slots_in_epoch(epoch),
+            absolute_slot: self.0,
+            block_height: tip
+                .block_height
+                .saturating_sub(tip.absolute_slot.saturating_sub(self.0)),
+            transaction_count: tip.transaction_count,
+        }
+    }
+}
 
 #[allow(deprecated)]
 use solana_sysvar::recent_blockhashes::MAX_ENTRIES;
@@ -1802,6 +1843,23 @@ impl SurfnetSvm {
         }
     }
 
+    /// Resolves `commitment` to a slot and refuses a `min_context_slot` above it, as Agave's
+    /// `get_bank_with_config` does. The surfnet keeps one account state, so this read reflects
+    /// every transaction up to this slot.
+    pub fn read_slot(
+        &self,
+        commitment: Option<CommitmentConfig>,
+        min_context_slot: Option<Slot>,
+    ) -> jsonrpc_core::Result<ReadSlot> {
+        let slot = self.slot_for_commitment(&commitment.unwrap_or_default());
+        match min_context_slot {
+            Some(min_context_slot) if slot < min_context_slot => {
+                Err(RpcCustomError::MinContextSlotNotReached { context_slot: slot }.into())
+            }
+            _ => Ok(ReadSlot(slot)),
+        }
+    }
+
     /// Recent blockhashes from the chain tip back, newest first.
     fn blockhashes_from_tip(&self) -> Vec<Hash> {
         let tip = self.latest_blockhash();
@@ -1831,6 +1889,19 @@ impl SurfnetSvm {
         self.blockhashes_from_tip()
             .get(self.min_blockhash_age(commitment))
             .copied()
+    }
+
+    /// The blockhash getLatestBlockhash reports at `commitment`, with its last valid block height.
+    pub fn latest_blockhash_at(&self, commitment: &CommitmentConfig) -> (Hash, u64) {
+        let blockhash = self
+            .blockhash_for_commitment(commitment)
+            .unwrap_or_else(|| self.latest_blockhash());
+        let age = self.blockhash_age(&blockhash).unwrap_or(0);
+        let minted_at_block_height = self.latest_epoch_info.block_height.saturating_sub(age);
+        (
+            blockhash,
+            minted_at_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64,
+        )
     }
 
     /// Blocks minted since `blockhash`, or `None` if it is not a recent blockhash.
