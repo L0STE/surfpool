@@ -33,8 +33,8 @@ use solana_client::{
     rpc_custom_error::RpcCustomError,
     rpc_filter::RpcFilterType,
     rpc_response::{
-        Response as RpcResponse, RpcKeyedAccount, RpcLogsResponse, RpcPerfSample,
-        RpcResponseContext,
+        Response as RpcResponse, RpcBlockUpdate, RpcBlockUpdateError, RpcKeyedAccount,
+        RpcLogsResponse, RpcPerfSample, RpcResponseContext,
     },
 };
 use solana_clock::{Clock, Slot};
@@ -111,7 +111,8 @@ use crate::{
     },
     storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
-        LogsSubscriptionData, locker::is_supported_token_program, surfnet_lite_svm::SurfnetLiteSvm,
+        BlockSubscriptionData, LogsSubscriptionData, locker::is_supported_token_program,
+        surfnet_lite_svm::SurfnetLiteSvm,
     },
     types::{
         GeyserAccountUpdate, MintAccount, OfflineAccountConfig, SerializableAccountAdditionalData,
@@ -538,6 +539,7 @@ pub struct SurfnetSvm {
     pub simulated_transaction_profiles: Box<dyn Storage<String, KeyedProfileResult>>,
     pub executed_transaction_profiles: Box<dyn Storage<String, KeyedProfileResult>>,
     pub logs_subscriptions: Vec<LogsSubscriptionData>,
+    pub block_subscriptions: Vec<BlockSubscriptionData>,
     pub snapshot_subscriptions: Vec<super::SnapshotSubscriptionData>,
     pub updated_at: u64,
     pub slot_time: u64,
@@ -887,6 +889,7 @@ impl SurfnetSvm {
             slot_subscriptions: Vec::new(),
             slots_updates_subscriptions: Vec::new(),
             logs_subscriptions: Vec::new(),
+            block_subscriptions: Vec::new(),
             snapshot_subscriptions: Vec::new(),
 
             updated_at: self.updated_at,
@@ -1308,6 +1311,7 @@ impl SurfnetSvm {
             simulated_transaction_profiles: simulated_transaction_profiles_db,
             executed_transaction_profiles: executed_transaction_profiles_db,
             logs_subscriptions: Vec::new(),
+            block_subscriptions: Vec::new(),
             snapshot_subscriptions: Vec::new(),
             updated_at,
             slot_time: config.slot_time,
@@ -3230,6 +3234,7 @@ impl SurfnetSvm {
             slots_update_ts,
         );
         self.emit_slot_status(slot, None, GeyserSlotStatus::Confirmed, slots_update_ts);
+        self.notify_block_subscribers(slot, CommitmentLevel::Confirmed);
 
         let epoch_schedule = self.inner.get_sysvar::<EpochSchedule>();
         let mut closed = self.inner.get_sysvar::<Clock>();
@@ -3267,6 +3272,7 @@ impl SurfnetSvm {
                 GeyserSlotStatus::Rooted,
                 slots_update_ts,
             );
+            self.notify_block_subscribers(root, CommitmentLevel::Finalized);
         }
 
         // The next slot is announced last, so none of its data can precede it.
@@ -4049,10 +4055,17 @@ impl SurfnetSvm {
         config: &RpcBlockConfig,
     ) -> SurfpoolResult<Option<UiConfirmedBlock>> {
         // Try to get stored block, or reconstruct empty block if within valid range
-        let Some(block) = self.get_block_or_reconstruct(slot)? else {
-            return Ok(None);
-        };
+        self.get_block_or_reconstruct(slot)?
+            .map(|block| self.encode_block(block, config))
+            .transpose()
+    }
 
+    /// Encodes `block` as getBlock answers it.
+    fn encode_block(
+        &self,
+        block: BlockHeader,
+        config: &RpcBlockConfig,
+    ) -> SurfpoolResult<UiConfirmedBlock> {
         let transaction_details = config.transaction_details.unwrap_or_default();
         // Signatures mode answers from the block header, so a missing tx record
         // cannot drop a signature and no transaction is loaded.
@@ -4090,7 +4103,7 @@ impl SurfnetSvm {
             },
         )?;
         block.signatures = signatures;
-        Ok(Some(block))
+        Ok(block)
     }
 
     /// Gets all accounts owned by a specific program ID from the account registry.
@@ -4499,6 +4512,85 @@ impl SurfnetSvm {
                 let _ = tx.send((self.get_latest_absolute_slot(), message));
             }
         }
+    }
+
+    pub fn subscribe_for_block_updates(
+        &mut self,
+        commitment_level: CommitmentLevel,
+        mentions: Option<Pubkey>,
+        config: RpcBlockConfig,
+    ) -> Arc<Receiver<RpcBlockUpdate>> {
+        let (tx, rx) = unbounded();
+        let rx = Arc::new(rx);
+        self.block_subscriptions.push((
+            commitment_level,
+            mentions,
+            config,
+            tx,
+            Arc::downgrade(&rx),
+        ));
+        rx
+    }
+
+    /// Sends the block at `slot` to the `blockSubscribe` subscribers at `commitment_level`,
+    /// encoded as getBlock answers it. A subscriber to the blocks that mention an account gets
+    /// only the transactions that do, and no notification for a block where none do.
+    fn notify_block_subscribers(&mut self, slot: Slot, commitment_level: CommitmentLevel) {
+        if self.block_subscriptions.is_empty() {
+            return;
+        }
+        let Ok(Some(block)) = self.get_block_or_reconstruct(slot) else {
+            return;
+        };
+        let mentions = |signature: &Signature, account: &Pubkey| {
+            let Ok(Some(status)) = self.transactions.get(&signature.to_string()) else {
+                return false;
+            };
+            status.as_processed().is_some_and(|(tx, _)| {
+                let loaded = &tx.meta.loaded_addresses;
+                tx.transaction
+                    .message
+                    .static_account_keys()
+                    .iter()
+                    .chain(&loaded.writable)
+                    .chain(&loaded.readonly)
+                    .any(|key| key == account)
+            })
+        };
+        let subscriptions = std::mem::take(&mut self.block_subscriptions);
+        self.block_subscriptions = subscriptions
+            .into_iter()
+            .filter(|(level, account, config, tx, rx)| {
+                if rx.strong_count() == 0 {
+                    return false;
+                }
+                if *level != commitment_level {
+                    return true;
+                }
+                let mut block = block.clone();
+                if let Some(account) = account {
+                    block
+                        .signatures
+                        .retain(|signature| mentions(signature, account));
+                    if block.signatures.is_empty() {
+                        return true;
+                    }
+                }
+                let update = match self.encode_block(block, config) {
+                    Ok(block) => RpcBlockUpdate {
+                        slot,
+                        block: Some(block),
+                        err: None,
+                    },
+                    Err(_) => RpcBlockUpdate {
+                        slot,
+                        block: None,
+                        err: Some(RpcBlockUpdateError::BlockStoreError),
+                    },
+                };
+                tx.send(update).is_ok()
+            })
+            .collect();
     }
 
     /// Registers a snapshot subscription and returns a sender and receiver for notifications.
@@ -7338,6 +7430,11 @@ mod tests {
     #[test]
     fn time_travel_skips_the_slots_it_jumps() {
         let (mut svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        let finalized_blocks = svm.subscribe_for_block_updates(
+            CommitmentLevel::Finalized,
+            None,
+            RpcBlockConfig::default(),
+        );
         for _ in 0..3 {
             svm.confirm_current_block().unwrap();
         }
@@ -7416,6 +7513,11 @@ mod tests {
         ]
         .map(|(slot, status, parent)| (slot, status.to_string(), parent));
         assert_eq!(lifecycle, expected);
+        let finalized: Vec<Slot> = finalized_blocks
+            .try_iter()
+            .map(|update| update.slot)
+            .collect();
+        assert_eq!(finalized, roots);
         // Travelling back into the gap abandons the landing past it: the open slot holds a block.
         svm.travel_to(last_block + 10).unwrap();
         assert!(

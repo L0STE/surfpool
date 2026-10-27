@@ -1252,6 +1252,7 @@ fn start_ws_rpc_server_runloop(
                 slot_subscription_map: Arc::new(RwLock::new(HashMap::new())),
                 slots_updates_subscription_map: Arc::new(RwLock::new(HashMap::new())),
                 logs_subscription_map: Arc::new(RwLock::new(HashMap::new())),
+                block_subscription_map: Arc::new(RwLock::new(HashMap::new())),
                 snapshot_subscription_map: Arc::new(RwLock::new(HashMap::new())),
                 tokio_handle: tokio_handle.clone(),
             }
