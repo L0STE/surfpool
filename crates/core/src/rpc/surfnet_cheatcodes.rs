@@ -35,7 +35,8 @@ use crate::{
         utils::{decode_and_deserialize, verify_pubkey, verify_pubkeys},
     },
     surfnet::{
-        AccountSource, GetAccountResult, locker::SvmAccessContext, svm::AccountUpdatePolicy,
+        AccountSource, GetAccountResult, locker::SvmAccessContext,
+        surfnet_lite_svm::reject_managed_sysvar, svm::AccountUpdatePolicy,
     },
     types::{
         TimeTravelConfig, TokenAccount, build_confidential_token_account_data,
@@ -1549,6 +1550,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             Ok(res) => res,
             Err(e) => return e.into(),
         };
+        // apply_account_update only reports insertion failures as events, so reject here.
+        if let Err(e) = reject_managed_sysvar(&pubkey) {
+            return e.into();
+        }
         let account_update_opt = match update.to_account_ext() {
             Err(e) => return Box::pin(future::err(e)),
             Ok(res) => res,
@@ -5258,6 +5263,38 @@ mod tests {
             0,
             "Should have no streamed accounts after empty call"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_account_rejects_clock_sysvar() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let clock = || {
+            client
+                .context
+                .svm_locker
+                .with_svm_reader(|svm| svm.inner.get_sysvar::<solana_clock::Clock>())
+        };
+        let before = clock();
+        let forged = solana_clock::Clock {
+            slot: before.slot + 1_000,
+            ..before.clone()
+        };
+
+        let err = client
+            .rpc
+            .set_account(
+                Some(client.context.clone()),
+                solana_sdk_ids::sysvar::clock::ID.to_string(),
+                AccountUpdate {
+                    data: Some(hex::encode(bincode::serialize(&forged).unwrap()).into_bytes()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("setting the Clock must be rejected");
+
+        assert!(format!("{err:?}").contains("surfnet_timeTravel"), "{err:?}");
+        assert_eq!(clock(), before);
     }
 
     #[test]

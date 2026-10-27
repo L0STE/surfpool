@@ -6230,11 +6230,35 @@ mod tests {
         // None value (skipped without remote)
         snapshot.insert(Pubkey::new_unique().to_string(), None);
 
+        // Clock sysvar (rejected: surfpool maintains it)
+        let clock_before = locker.with_svm_reader(|svm| svm.inner.get_sysvar::<Clock>());
+        snapshot.insert(
+            solana_sdk_ids::sysvar::clock::ID.to_string(),
+            Some(AccountSnapshot {
+                lamports: 1_169_280,
+                owner: solana_sdk_ids::sysvar::ID.to_string(),
+                executable: false,
+                rent_epoch: 0,
+                data: general_purpose::STANDARD.encode(
+                    bincode::serialize(&Clock {
+                        slot: 1,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ),
+                parsed_data: None,
+            }),
+        );
+
         let loaded = locker
             .load_snapshot(&snapshot, None, CommitmentConfig::confirmed())
             .await
             .unwrap();
         assert_eq!(loaded, 1);
+        assert_eq!(
+            locker.with_svm_reader(|svm| svm.inner.get_sysvar::<Clock>()),
+            clock_before
+        );
 
         // Only the valid account should exist
         assert!(
