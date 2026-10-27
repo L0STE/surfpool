@@ -4045,7 +4045,7 @@ impl SurfnetSvmLocker {
         &self,
         account_pubkey: &Pubkey,
         encoding: Option<UiAccountEncoding>,
-    ) -> Receiver<UiAccount> {
+    ) -> Receiver<(Slot, UiAccount)> {
         // Handles the locking/unlocking safely
         self.with_svm_writer(|svm_writer| {
             svm_writer.subscribe_for_account_updates(account_pubkey, encoding)
@@ -4058,7 +4058,7 @@ impl SurfnetSvmLocker {
         program_id: &Pubkey,
         encoding: Option<UiAccountEncoding>,
         filters: Option<Vec<RpcFilterType>>,
-    ) -> Receiver<RpcKeyedAccount> {
+    ) -> Receiver<(Slot, RpcKeyedAccount)> {
         self.with_svm_writer(|svm_writer| {
             svm_writer.subscribe_for_program_updates(program_id, encoding, filters)
         })

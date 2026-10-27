@@ -8081,7 +8081,7 @@ async fn test_ws_account_subscribe_balance_change(test_type: TestType) {
     let account_update = account_rx.recv_timeout(Duration::from_secs(5));
     assert!(account_update.is_ok(), "Should receive account update");
 
-    let updated_account = account_update.unwrap();
+    let (_, updated_account) = account_update.unwrap();
     assert_eq!(
         updated_account.lamports,
         LAMPORTS_PER_SOL - 1_000_000 - 5000, // original - transfer amount - fees
@@ -8283,7 +8283,7 @@ async fn test_ws_account_subscribe_new_account_creation(test_type: TestType) {
         "Should receive notification when account is created"
     );
 
-    let created_account = account_update.unwrap();
+    let (_, created_account) = account_update.unwrap();
     assert_eq!(
         created_account.lamports, 1_000_000,
         "New account should have correct balance"
@@ -10840,7 +10840,7 @@ async fn test_ws_program_subscribe_basic(test_type: TestType) {
     let update = program_rx.recv_timeout(Duration::from_secs(5));
     assert!(update.is_ok(), "Should receive program account update");
 
-    let keyed_account = update.unwrap();
+    let (_, keyed_account) = update.unwrap();
     assert_eq!(
         keyed_account.pubkey,
         account_pubkey.to_string(),
@@ -10916,7 +10916,7 @@ async fn test_ws_program_subscribe_data_size_filter(test_type: TestType) {
         "Should receive notification for account matching dataSize filter"
     );
 
-    let keyed_account = update.unwrap();
+    let (_, keyed_account) = update.unwrap();
     assert_eq!(
         keyed_account.pubkey,
         matching_account_pubkey.to_string(),
@@ -10990,7 +10990,7 @@ async fn test_ws_program_subscribe_memcmp_filter(test_type: TestType) {
         "Should receive notification for account matching memcmp filter"
     );
 
-    let keyed_account = update.unwrap();
+    let (_, keyed_account) = update.unwrap();
     assert_eq!(
         keyed_account.pubkey,
         matching_pubkey.to_string(),

@@ -3724,7 +3724,7 @@ impl SurfnetSvm {
         &mut self,
         account_pubkey: &Pubkey,
         encoding: Option<UiAccountEncoding>,
-    ) -> Receiver<UiAccount> {
+    ) -> Receiver<(Slot, UiAccount)> {
         let (tx, rx) = unbounded();
         self.account_subscriptions
             .entry(*account_pubkey)
@@ -3738,7 +3738,7 @@ impl SurfnetSvm {
         program_id: &Pubkey,
         encoding: Option<UiAccountEncoding>,
         filters: Option<Vec<RpcFilterType>>,
-    ) -> Receiver<RpcKeyedAccount> {
+    ) -> Receiver<(Slot, RpcKeyedAccount)> {
         let (tx, rx) = unbounded();
         self.program_subscriptions
             .entry(*program_id)
@@ -3784,6 +3784,7 @@ impl SurfnetSvm {
         account_updated_pubkey: &Pubkey,
         account: &Account,
     ) {
+        let slot = self.get_latest_absolute_slot();
         let mut remaining = vec![];
         if let Some(subscriptions) = self.account_subscriptions.remove(account_updated_pubkey) {
             for (encoding, tx) in subscriptions {
@@ -3794,7 +3795,7 @@ impl SurfnetSvm {
                 let account = self
                     .account_to_rpc_keyed_account(account_updated_pubkey, account, &config, None)
                     .account;
-                if tx.send(account).is_err() {
+                if tx.send((slot, account)).is_err() {
                     // The receiver has been dropped, so we can skip notifying
                     continue;
                 } else {
@@ -3810,6 +3811,7 @@ impl SurfnetSvm {
 
     pub fn notify_program_subscribers(&mut self, account_pubkey: &Pubkey, account: &Account) {
         let program_id = account.owner;
+        let slot = self.get_latest_absolute_slot();
         let mut remaining = vec![];
         if let Some(subscriptions) = self.program_subscriptions.remove(&program_id) {
             for (encoding, filters, tx) in subscriptions {
@@ -3828,7 +3830,7 @@ impl SurfnetSvm {
                 };
                 let keyed_account =
                     self.account_to_rpc_keyed_account(account_pubkey, account, &config, None);
-                if tx.send(keyed_account).is_err() {
+                if tx.send((slot, keyed_account)).is_err() {
                     // The receiver has been dropped, so we can skip notifying
                     continue;
                 } else {
@@ -8613,7 +8615,7 @@ mod tests {
             .unwrap();
 
         let account = svm.get_account(&account_pubkey).unwrap().unwrap();
-        let update = updates
+        let (_, update) = updates
             .try_recv()
             .expect("the override must notify the account's subscribers");
         assert_eq!(update.data.decode(), Some(account.data));
