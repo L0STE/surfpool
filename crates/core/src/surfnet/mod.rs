@@ -47,6 +47,8 @@ pub type AccountFactory = Box<dyn Fn(SurfnetSvmLocker) -> GetAccountResult + Sen
 /// Mirrors `agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeyserSlotStatus {
+    /// Slot is open on its parent block
+    CreatedBank,
     /// Slot is being processed
     Processed,
     /// Slot has been rooted (finalized)

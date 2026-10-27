@@ -1728,13 +1728,7 @@ impl SurfnetSvm {
                 .map(|&(key, hash)| (if key == open { slot } else { key }, hash))
                 .collect();
             self.inner.set_sysvar(&SlotHashes::new(&slot_hashes));
-            let root = self.slot_for_commitment(&CommitmentConfig::finalized());
-            self.notify_slot_subscribers(slot, parent, root);
-            self.notify_slots_updates_subscribers(SlotUpdate::CreatedBank {
-                slot,
-                parent,
-                timestamp: Utc::now().timestamp_millis().max(0) as u64,
-            });
+            self.announce_open_slot();
         }
         Ok(())
     }
@@ -2583,6 +2577,7 @@ impl SurfnetSvm {
         self.last_checkpoint_slot = self.genesis_slot;
         self.store_genesis_anchor()?;
         self.recent_blockhashes.clear();
+        self.announce_open_slot();
 
         Ok(())
     }
@@ -3172,17 +3167,10 @@ impl SurfnetSvm {
         let total_transactions = self.latest_epoch_info.transaction_count.unwrap_or(0);
         self.latest_epoch_info.transaction_count = Some(total_transactions + num_transactions);
 
-        let parent_slot = self.latest_epoch_info.absolute_slot.saturating_sub(1);
-        let new_slot = self.latest_epoch_info.absolute_slot;
-        let root = self.slot_for_commitment(&CommitmentConfig::finalized());
-        self.notify_slot_subscribers(new_slot, parent_slot, root);
-
         // Emit `slotsUpdatesNotification` events for the lifecycle transition
         // we just completed:
         //   * `Frozen`     – the slot that was just closed (`slot`) is now
         //                    immutable; surface its execution stats.
-        //   * `CreatedBank`– the next slot (`new_slot`) has just been opened
-        //                    on top of `parent_slot` (= the freshly-frozen slot).
         // Surfpool's execution model has no gossip layer, so the
         // `FirstShredReceived` / `Completed` / `Dead` variants documented by
         // Solana are intentionally not produced here.
@@ -3201,26 +3189,23 @@ impl SurfnetSvm {
                 max_transactions_per_entry: num_transactions,
             },
         });
-        self.notify_slots_updates_subscribers(SlotUpdate::CreatedBank {
-            slot: new_slot,
-            parent: parent_slot,
-            timestamp: slots_update_ts,
-        });
 
-        // Emit confirmation for the same slot used by processed account/transaction updates.
-        self.geyser_events_tx
-            .send(GeyserEvent::UpdateSlotStatus {
-                slot,
-                parent: Some(parent),
-                status: GeyserSlotStatus::Confirmed,
-            })
-            .ok();
-        // Mirror the Confirmed Geyser event as an `OptimisticConfirmation`
-        // notification for `slotsUpdatesSubscribe` clients.
-        self.notify_slots_updates_subscribers(SlotUpdate::OptimisticConfirmation {
+        // The block's entry goes before its metadata: Yellowstone drops the metadata of an empty
+        // block whose entry arrives after it.
+        let entry_hash = solana_hash::Hash::from_str(&self.chain_tip.hash)
+            .map(|h| h.to_bytes().to_vec())
+            .unwrap_or_else(|_| vec![0u8; 32]);
+        let entry_info = GeyserEntryInfo {
             slot,
-            timestamp: slots_update_ts,
-        });
+            index: 0, // Single entry per block
+            num_hashes: 1,
+            hash: entry_hash,
+            executed_transaction_count: num_transactions,
+            starting_transaction_index: 0,
+        };
+        self.geyser_events_tx
+            .send(GeyserEvent::NotifyEntry(entry_info))
+            .ok();
 
         // Notify geyser plugins of block metadata
         let block_metadata = GeyserBlockMetadata {
@@ -3237,21 +3222,14 @@ impl SurfnetSvm {
             .send(GeyserEvent::NotifyBlockMetadata(block_metadata))
             .ok();
 
-        // Notify geyser plugins of entry (Surfpool emits 1 entry per block)
-        let entry_hash = solana_hash::Hash::from_str(&self.chain_tip.hash)
-            .map(|h| h.to_bytes().to_vec())
-            .unwrap_or_else(|_| vec![0u8; 32]);
-        let entry_info = GeyserEntryInfo {
+        // The block's statuses follow its data. Confirmed carries no parent, as in Agave.
+        self.emit_slot_status(
             slot,
-            index: 0, // Single entry per block
-            num_hashes: 1,
-            hash: entry_hash,
-            executed_transaction_count: num_transactions,
-            starting_transaction_index: 0,
-        };
-        self.geyser_events_tx
-            .send(GeyserEvent::NotifyEntry(entry_info))
-            .ok();
+            Some(parent),
+            GeyserSlotStatus::Processed,
+            slots_update_ts,
+        );
+        self.emit_slot_status(slot, None, GeyserSlotStatus::Confirmed, slots_update_ts);
 
         let epoch_schedule = self.inner.get_sysvar::<EpochSchedule>();
         let mut closed = self.inner.get_sysvar::<Clock>();
@@ -3279,22 +3257,20 @@ impl SurfnetSvm {
         // Notify geyser plugins of newly rooted (finalized) slots: the blocks after the parent
         // block's root, in order.
         let rooted_before = self.blocks_back(parent, self.finalization_slot_threshold() - 1);
+        let root = self.slot_for_commitment(&CommitmentConfig::finalized());
         let roots = self.block_runs((rooted_before + 1).max(self.genesis_slot), root);
         for root in roots.into_iter().flatten() {
-            self.geyser_events_tx
-                .send(GeyserEvent::UpdateSlotStatus {
-                    slot: root,
-                    parent: Some(self.parent_slot(root)),
-                    status: GeyserSlotStatus::Rooted,
-                })
-                .ok();
-            // Mirror the Rooted Geyser event as a `Root` notification for
-            // `slotsUpdatesSubscribe` clients.
-            self.notify_slots_updates_subscribers(SlotUpdate::Root {
-                slot: root,
-                timestamp: slots_update_ts,
-            });
+            let parent = self.parent_slot(root);
+            self.emit_slot_status(
+                root,
+                Some(parent),
+                GeyserSlotStatus::Rooted,
+                slots_update_ts,
+            );
         }
+
+        // The next slot is announced last, so none of its data can precede it.
+        self.announce_open_slot();
 
         // Evict the accounts marked as streamed from cache to enforce them to be fetched again
         let accounts_to_reset: Vec<_> = self.streamed_accounts.into_iter()?.collect();
@@ -4370,6 +4346,51 @@ impl SurfnetSvm {
         let arc = Arc::new(update);
         self.slots_updates_subscriptions
             .retain(|tx| tx.send(arc.clone()).is_ok());
+    }
+
+    /// Sends a slot status to Geyser plugins and mirrors it to `slotsUpdatesSubscribe`, so the
+    /// two streams can't disagree.
+    fn emit_slot_status(
+        &mut self,
+        slot: Slot,
+        parent: Option<Slot>,
+        status: GeyserSlotStatus,
+        timestamp: u64,
+    ) {
+        let update = match status {
+            GeyserSlotStatus::CreatedBank => Some(SlotUpdate::CreatedBank {
+                slot,
+                parent: parent.unwrap_or_default(),
+                timestamp,
+            }),
+            GeyserSlotStatus::Processed => None,
+            GeyserSlotStatus::Confirmed => {
+                Some(SlotUpdate::OptimisticConfirmation { slot, timestamp })
+            }
+            GeyserSlotStatus::Rooted => Some(SlotUpdate::Root { slot, timestamp }),
+        };
+        self.geyser_events_tx
+            .send(GeyserEvent::UpdateSlotStatus {
+                slot,
+                parent,
+                status,
+            })
+            .ok();
+        if let Some(update) = update {
+            self.notify_slots_updates_subscribers(update);
+        }
+    }
+
+    /// Announces the open slot on its parent block, as Agave does when it creates the slot's
+    /// bank: at startup, after each block, after a time travel and a reset. A skipped slot gets
+    /// none.
+    pub fn announce_open_slot(&mut self) {
+        let slot = self.get_latest_absolute_slot();
+        let parent = self.parent_slot(slot);
+        let root = self.slot_for_commitment(&CommitmentConfig::finalized());
+        self.notify_slot_subscribers(slot, parent, root);
+        let timestamp = Utc::now().timestamp_millis().max(0) as u64;
+        self.emit_slot_status(slot, Some(parent), GeyserSlotStatus::CreatedBank, timestamp);
     }
 
     pub fn write_simulated_profile_result(
@@ -6286,7 +6307,8 @@ mod tests {
             ..SurfnetSvmConfig::default()
         };
         let (open, height, tip) = {
-            let (mut svm, _events_rx, _geyser_rx) =
+            // Nothing drains Geyser here, so its receiver is dropped: a full channel would block.
+            let (mut svm, _events_rx, _) =
                 SurfnetSvm::new_with_db(Some(database_url), config.clone()).unwrap();
             let target_slot = svm.checkpoint_interval_slots().max(INITIAL_SLOT);
             while svm.get_latest_absolute_slot() <= target_slot {
@@ -7233,18 +7255,16 @@ mod tests {
     }
 
     /// The blocks Geyser announced, and the slots it rooted, in the order it sent them.
-    fn streamed_blocks_and_roots(
-        geyser_rx: &Receiver<GeyserEvent>,
-    ) -> (Vec<GeyserBlockMetadata>, Vec<Slot>) {
+    fn streamed_blocks_and_roots(events: &[GeyserEvent]) -> (Vec<GeyserBlockMetadata>, Vec<Slot>) {
         let (mut blocks, mut roots) = (vec![], vec![]);
-        for event in geyser_rx.try_iter() {
+        for event in events {
             match event {
-                GeyserEvent::NotifyBlockMetadata(block) => blocks.push(block),
+                GeyserEvent::NotifyBlockMetadata(block) => blocks.push(block.clone()),
                 GeyserEvent::UpdateSlotStatus {
                     slot,
                     status: GeyserSlotStatus::Rooted,
                     ..
-                } => roots.push(slot),
+                } => roots.push(*slot),
                 _ => {}
             }
         }
@@ -7300,7 +7320,7 @@ mod tests {
             svm.confirm_current_block().unwrap();
         }
 
-        let (blocks, _) = streamed_blocks_and_roots(&geyser_rx);
+        let (blocks, _) = streamed_blocks_and_roots(&geyser_rx.try_iter().collect::<Vec<_>>());
         let ended = if alpenglow { svm.slot_time as i64 } else { 0 };
         let expected: Vec<_> = clock_times
             .iter()
@@ -7340,7 +7360,8 @@ mod tests {
             svm.confirm_current_block().unwrap();
         }
 
-        let (blocks, roots) = streamed_blocks_and_roots(&geyser_rx);
+        let events: Vec<_> = geyser_rx.try_iter().collect();
+        let (blocks, roots) = streamed_blocks_and_roots(&events);
         for pair in blocks.windows(2) {
             assert_eq!(
                 (pair[1].parent_slot, pair[1].block_height),
@@ -7357,6 +7378,44 @@ mod tests {
         let produced: Vec<Slot> = blocks.iter().map(|block| block.slot).collect();
         assert_eq!(roots, produced[..roots.len()]);
         assert!(roots.contains(&last_block) && roots.contains(&landing));
+        // Around the jump, Geyser hears each block's entry, then its metadata, Processed and
+        // Confirmed; the landing announced on the last block before content can reach it; each
+        // block rooted once, with its parent; and nothing for a skipped slot.
+        let lifecycle: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                GeyserEvent::UpdateSlotStatus {
+                    slot,
+                    parent,
+                    status,
+                } => Some((*slot, format!("{status:?}"), *parent)),
+                GeyserEvent::NotifyEntry(entry) => Some((entry.slot, "Entry".into(), None)),
+                GeyserEvent::NotifyBlockMetadata(block) => {
+                    Some((block.slot, "BlockMeta".into(), None))
+                }
+                _ => None,
+            })
+            .filter(|(slot, ..)| (last_block..=landing).contains(slot))
+            .collect();
+        let (last, before) = (last_block, last_block - 1);
+        let expected = [
+            (last, "CreatedBank", Some(before)),
+            (last, "Entry", None),
+            (last, "BlockMeta", None),
+            (last, "Processed", Some(before)),
+            (last, "Confirmed", None),
+            (last + 1, "CreatedBank", Some(last)),
+            (last + 50, "CreatedBank", Some(last)),
+            (landing, "CreatedBank", Some(last)),
+            (landing, "Entry", None),
+            (landing, "BlockMeta", None),
+            (landing, "Processed", Some(last)),
+            (landing, "Confirmed", None),
+            (last, "Rooted", Some(before)),
+            (landing, "Rooted", Some(last)),
+        ]
+        .map(|(slot, status, parent)| (slot, status.to_string(), parent));
+        assert_eq!(lifecycle, expected);
         // Travelling back into the gap abandons the landing past it: the open slot holds a block.
         svm.travel_to(last_block + 10).unwrap();
         assert!(
@@ -7384,7 +7443,7 @@ mod tests {
         svm.confirm_current_block().unwrap();
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
 
-        let (blocks, roots) = streamed_blocks_and_roots(&geyser_rx);
+        let (blocks, roots) = streamed_blocks_and_roots(&geyser_rx.try_iter().collect::<Vec<_>>());
         let before_jump: Vec<Slot> = blocks
             .iter()
             .map(|block| block.slot)
@@ -7395,7 +7454,10 @@ mod tests {
         for _ in 1..svm.finalization_slot_threshold() - 1 {
             svm.confirm_current_block().unwrap();
         }
-        assert_eq!(streamed_blocks_and_roots(&geyser_rx).1, before_jump);
+        assert_eq!(
+            streamed_blocks_and_roots(&geyser_rx.try_iter().collect::<Vec<_>>()).1,
+            before_jump
+        );
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
