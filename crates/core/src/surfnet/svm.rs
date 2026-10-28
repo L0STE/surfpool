@@ -109,7 +109,7 @@ use crate::{
         },
         template_registry,
     },
-    storage::{OverlayStorage, Storage, StorageBackend},
+    storage::{OverlayStorage, ProfileFifoMap, Storage, StorageBackend},
     surfnet::{
         LogsSubscriptionData, locker::is_supported_token_program, surfnet_lite_svm::SurfnetLiteSvm,
     },
@@ -1256,7 +1256,14 @@ impl SurfnetSvm {
                 "executed_transaction_profiles",
                 // Use FifoMap for executed_transaction_profiles to maintain FIFO eviction behavior
                 // (when no on-disk DB is provided)
-                move || Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles)),
+                move || {
+                    Box::new(Arc::new(ProfileFifoMap(FifoMap::<
+                        String,
+                        KeyedProfileResult,
+                    >::new(
+                        max_profiles
+                    ))))
+                },
             )?
         };
         let epoch_schedule = Self::default_epoch_schedule();
